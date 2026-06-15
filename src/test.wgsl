@@ -1,3 +1,6 @@
+@group(0) @binding(0)
+var<uniform> camera: mat4x4<f32>;
+
 struct VxIn {
     @location(0) pos: vec3f,
     @location(1) color: vec3f,
@@ -11,10 +14,10 @@ struct FragOut {
 @vertex
 fn vs_main(input: VxIn) -> FragOut {
     return FragOut(
-        vec4f(input.pos, 1.0),
-        vec4f(input.color, 1.0)
+        camera * vec4<f32>(input.pos, 1.0),
+        vec4<f32>(input.color, 1.0)
     );
-}
+};
 
 @fragment
 fn fs_main(in: FragOut) -> @location(0) vec4f {
