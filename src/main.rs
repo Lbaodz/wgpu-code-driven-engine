@@ -1,4 +1,4 @@
-use cgmath::{Deg, InnerSpace, Matrix4, Point3, Vector3};
+use cgmath::{Deg, InnerSpace, Matrix4, Point3, Vector3, dot};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use wgpu::util::{BufferInitDescriptor, DeviceExt};
@@ -6,7 +6,58 @@ use winit::application::ApplicationHandler;
 use winit::event::{KeyEvent, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
-use winit::window::{CursorGrabMode, Window, WindowId};
+use winit::window::{CursorGrabMode, Window, WindowId, Fullscreen};
+
+#[derive(Default)]
+struct Plane {
+    normal: [f32;3],
+    d: f32,
+}
+
+struct Planes {
+    left: Plane,
+    right: Plane,
+    bottom: Plane,
+    up: Plane,
+    near: Plane,
+    far: Plane,
+}
+
+impl Planes {
+    fn build_plane_from_matrix4(matrix4: Matrix4<f32>) -> Self {
+        let m = matrix4;
+        let make_plane = |nx, ny, nz, d| {
+            let length = Vector3::new(nx, ny, nz).magnitude();
+            Plane {
+                normal: [nx / length, ny / length, nz / length],
+                d: d / length,
+            }
+        };
+        Self {
+            left: make_plane(m.x.w + m.x.x, m.y.w + m.y.x, m.z.w + m.z.x, m.w.w + m.w.x),
+            right: make_plane(m.x.w - m.x.x, m.y.w - m.y.x, m.z.w - m.z.x, m.w.w - m.w.x),
+            bottom: make_plane(m.x.w + m.x.y, m.y.w + m.y.y, m.z.w + m.z.y, m.w.w + m.w.y),
+            up: make_plane(m.x.w - m.x.y, m.y.w - m.y.y, m.z.w - m.z.y, m.w.w - m.w.y),
+            near: make_plane(m.x.w + m.x.z, m.y.w + m.y.z, m.z.w + m.z.z, m.w.w + m.w.z),
+            far: make_plane(m.x.w - m.x.z, m.y.w - m.y.z, m.z.w - m.z.z, m.w.w - m.w.z),
+        }
+    }
+
+    fn frustum_culling(&self, min: [f32;3], max: [f32;3]) -> bool {
+        let planes = [&self.left, &self.right, &self.bottom, &self.up, &self.near, &self.far];
+        for plane in planes {
+            let mut positive_normal: [f32;3] = [0.0;3];
+            let normal = plane.normal;
+            for i in 0..3 {
+                if normal[i] >= 0.0 {
+                    positive_normal[i] = max[i];
+                } else { positive_normal[i] = min[i]; }
+            }
+            if dot::<Vector3<f32>>(normal.into(), positive_normal.into()) + plane.d < 0.0 { return false; }
+        };
+        true
+    }
+}
 
 #[derive(Default)]
 struct InputState {
@@ -33,7 +84,8 @@ struct Camera {
 impl Camera {
     fn make_camera(&self) -> Matrix4<f32> {
         let view = Matrix4::look_at_rh(self.eye, self.target, self.up);
-        let proj = cgmath::perspective(Deg(self.fov), self.aspect, self.near, self.far);
+        let v_fov = 2.0 * ((self.fov.to_radians() / 2.0).tan() / self.aspect).atan();
+        let proj = cgmath::perspective(Deg(v_fov.to_degrees()), self.aspect, self.near, self.far);
         let wgpu_matrix_correction = Matrix4::new(
             1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.5, 0.5, 0.0, 0.0, 0.0, 1.0,
         );
@@ -68,9 +120,18 @@ struct Vertex {
     normal: [f32; 3],
 }
 
-struct Mesh {
-    verticles: Vec<Vertex>,
-    indices: Vec<u32>,
+struct Primitive {
+    start: u32,
+    count: u32,
+    min: [f32; 3],
+    max: [f32; 3],
+    // Some(texture) 
+}
+
+struct Meshes {
+    vertex_buffer: wgpu::Buffer, 
+    index_buffer: wgpu::Buffer, 
+    primitves: Vec<Primitive>,
 }
 
 struct WgpuCtx {
@@ -79,12 +140,12 @@ struct WgpuCtx {
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
     pipeline: wgpu::RenderPipeline,
-    vertex_buffer: wgpu::Buffer,
-    index_buffer: wgpu::Buffer,
     camera_bind_group: wgpu::BindGroup,
     camera_buffer: wgpu::Buffer,
     camera: Camera,
-    meshes: Vec<Mesh>,
+    camera_planes: Planes,
+    meshes: Vec<Meshes>,
+    depth_view: wgpu::TextureView,
 }
 
 #[derive(Default)]
@@ -103,24 +164,35 @@ impl MyApp {
     }
 }
 
-fn load_model(path: &str) -> (Vec<Vertex>, Vec<u32>) {
+fn load_model(path: &str, device: &wgpu::Device) -> Vec<Meshes> {
     let (document, buffers, _images) = gltf::import(path).expect("Not found path");
-
+    // return
+    let mut objects: Vec<Meshes> = Vec::new();
+    // buffer render offset **IMPORTANT: NO SEPARATE BUFFER FOR EACH RETURN**
     let mut all_verticles: Vec<Vertex> = Vec::new();
     let mut all_indices: Vec<u32> = Vec::new();
+    // index range
+    let mut pris: Vec<Primitive> = Vec::new();
+
     for mesh in document.meshes() {
+
         for primitive in mesh.primitives() {
+            let accessor = primitive.get(&gltf::Semantic::Positions).unwrap();
+            let (mi, ma) = (accessor.min().unwrap(), accessor.max().unwrap());
+            let min: [f32;3] = serde_json::from_value(mi.clone()).expect("cant extract min");
+            let max: [f32;3] = serde_json::from_value(ma.clone()).expect("cant extract min");
+
             let reader = primitive.reader(|b| Some(&buffers[b.index()]));
             let pos: Vec<[f32; 3]> = reader.read_positions().expect("cant get pos").collect();
+            let count = pos.len();
             let col: Vec<[f32; 3]> = if let Some(color) = reader.read_colors(0) {
                 color.into_rgb_f32().collect()
             } else {
-                let count = pos.len();
                 vec![[1.0, 0.0, 1.0]; count]
             };
             let nor: Vec<[f32; 3]> = reader.read_normals().expect("cant get nor").collect();
-            let verticle: Vec<Vertex> = pos.iter().zip(nor.iter()).zip(col.iter())
-            .map(|((p, n), c)| Vertex { position: *p, color: *c, normal: *n })
+            let verticle: Vec<Vertex> = (0..count)
+            .map(|i| Vertex { position: pos[i], color: col[i], normal: nor[i] })
             .collect();
 
             let offset = all_verticles.len() as u32;
@@ -128,11 +200,32 @@ fn load_model(path: &str) -> (Vec<Vertex>, Vec<u32>) {
             .map(|i| i + offset)
             .collect();
 
+            pris.push(
+                Primitive { start: offset, count: indices.len() as u32, min, max }
+            );
+
             all_verticles.extend(verticle);
             all_indices.extend(indices);
         }
     }
-    (all_verticles, all_indices)
+    let vertex_buffer = device.create_buffer_init(&BufferInitDescriptor {
+        label: Some("vx_buffer"),
+        contents: bytemuck::cast_slice(&all_verticles),
+        usage: wgpu::BufferUsages::VERTEX,
+    });
+    let index_buffer = device.create_buffer_init(&BufferInitDescriptor {
+        label: Some("ix_buffer"),
+        contents: bytemuck::cast_slice(&all_indices),
+        usage: wgpu::BufferUsages::INDEX,
+    });
+    objects.push(
+        Meshes {
+            vertex_buffer,
+            index_buffer,
+            primitves: pris,
+        }
+    );
+    objects
 }
 
 impl WgpuCtx {
@@ -154,7 +247,8 @@ impl WgpuCtx {
 impl ApplicationHandler for MyApp {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         let window = self.set_default_app("My app", event_loop);
-
+        let monitor = window.current_monitor();
+        window.set_fullscreen(Some(Fullscreen::Borderless(monitor)));
         let gpu_ctx = pollster::block_on(async {
             let ins = wgpu::Instance::default();
             let surface = ins.create_surface(Arc::clone(&window)).unwrap();
@@ -189,21 +283,13 @@ impl ApplicationHandler for MyApp {
                 view_formats: vec![],
             };
             surface.configure(&device, &config);
+            let mut meshes: Vec<Meshes> = Vec::new();
 
-            // for path in paths later..
-            let (verticles, indices) = load_model("./src/Untitled.gltf");
-            let vertex_buffer = device.create_buffer_init(&BufferInitDescriptor {
-                label: Some("vx_buffer"),
-                contents: bytemuck::cast_slice(&verticles),
-                usage: wgpu::BufferUsages::VERTEX,
-            });
-            let index_buffer = device.create_buffer_init(&BufferInitDescriptor {
-                label: Some("ix_buffer"),
-                contents: bytemuck::cast_slice(&indices),
-                usage: wgpu::BufferUsages::INDEX,
-            });
-
-            let meshes: Vec<Mesh> = vec![Mesh { verticles, indices }];
+            let paths = ["./src/Untitled.gltf"];
+            // for path in paths later.. and meshes[i] *for each* file gltf loaded
+            for path in paths {
+                meshes.extend(load_model(path, &device));
+            }
             // end for return vec
 
             let camera = Camera {
@@ -221,6 +307,8 @@ impl ApplicationHandler for MyApp {
             let camera_uniform = UniformCamera {
                 uniform: camera.make_camera().into(),
             };
+
+            let camera_planes = Planes::build_plane_from_matrix4(camera_uniform.uniform.into());
 
             let camera_buffer = device.create_buffer_init(&BufferInitDescriptor {
                 label: Some("cmr_buffer"),
@@ -283,7 +371,13 @@ impl ApplicationHandler for MyApp {
                     cull_mode: Some(wgpu::Face::Back),
                     ..Default::default()
                 },
-                depth_stencil: None,
+                depth_stencil: Some(wgpu::DepthStencilState { 
+                    format: wgpu::TextureFormat::Depth32Float, 
+                    depth_write_enabled: Some(true),
+                    depth_compare: Some(wgpu::CompareFunction::Less), 
+                    stencil: wgpu::StencilState::default(), 
+                    bias: wgpu::DepthBiasState::default(), 
+                }),
                 multisample: wgpu::MultisampleState::default(),
                 multiview_mask: None,
                 cache: None,
@@ -298,18 +392,34 @@ impl ApplicationHandler for MyApp {
                 }],
             });
 
+            let depth_texture = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("depth tt"),
+                format: wgpu::TextureFormat::Depth32Float,
+                dimension: wgpu::TextureDimension::D2,
+                mip_level_count: 1,
+                sample_count: 1,
+                size: wgpu::Extent3d {
+                    width: config.width,
+                    height: config.height,
+                    depth_or_array_layers: 1,
+                },
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                view_formats: &[wgpu::TextureFormat::Depth32Float],
+            });
+            let depth_view = depth_texture.create_view(&wgpu::TextureViewDescriptor::default());
+
             WgpuCtx {
                 surface,
                 device,
                 queue,
                 config,
                 pipeline,
-                vertex_buffer,
-                index_buffer,
                 camera_bind_group,
                 camera_buffer,
                 camera,
                 meshes,
+                camera_planes,
+                depth_view,
             }
         });
 
@@ -336,7 +446,6 @@ impl ApplicationHandler for MyApp {
                         win.set_cursor_visible(true);
                         let _ = win.set_cursor_grab(CursorGrabMode::None);
                         self.mouse_locked = false;
-                        println!("UNLOCKED");
                     }
                 }
             }
@@ -400,13 +509,30 @@ impl ApplicationHandler for MyApp {
                                             store: wgpu::StoreOp::Store,
                                         },
                                     })],
+                                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                                        view: &gpu.depth_view,
+                                        depth_ops: Some(wgpu::Operations {
+                                            load: wgpu::LoadOp::Clear(1.0),
+                                            store: wgpu::StoreOp::Store,
+                                        }),
+                                        stencil_ops: None,
+                                    }),
                                     ..Default::default()
                                 });
                             render_pass.set_pipeline(&gpu.pipeline);
                             render_pass.set_bind_group(0, &gpu.camera_bind_group, &[]);
-                            render_pass.set_vertex_buffer(0, gpu.vertex_buffer.slice(..));
-                            render_pass.set_index_buffer(gpu.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-                            render_pass.draw_indexed(0..gpu.meshes[0].indices.len() as u32, 0, 0..1);
+                            
+                            for (_, mesh) in gpu.meshes.iter().enumerate() {
+                                render_pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
+                                render_pass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                                let primitives = &mesh.primitves;
+                                for primitive in primitives {
+                                    if gpu.camera_planes.frustum_culling(primitive.min, primitive.max) {
+                                        render_pass.draw_indexed(primitive.start..(primitive.start + primitive.count), 0, 0..1);
+                                    }
+                                }
+                            }
+
                         }
                         gpu.queue.submit(std::iter::once(encoder.finish()));
                         frame.present();
@@ -425,8 +551,8 @@ impl ApplicationHandler for MyApp {
 
     fn device_event(
         &mut self,
-        event_loop: &ActiveEventLoop,
-        device_id: winit::event::DeviceId,
+        _event_loop: &ActiveEventLoop,
+        _device_id: winit::event::DeviceId,
         event: winit::event::DeviceEvent,
     ) {
         if self.mouse_locked {
@@ -451,7 +577,7 @@ impl ApplicationHandler for MyApp {
 
     fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
         if let (Some(win), Some(last_time)) = (&self.window, &self.last_time) {
-            let desire_time = Duration::from_secs_f64(1.0 / 60.0);
+            let desire_time = Duration::from_secs_f64(1.0 / 90.0);
             let time_eslaped = last_time.elapsed();
             if time_eslaped < desire_time {
                 let sleep_time = desire_time - time_eslaped;
@@ -490,6 +616,7 @@ impl ApplicationHandler for MyApp {
                 gpu.camera.eye += velocity.normalize() * speed;
                 gpu.camera.update_target();
                }
+               gpu.camera_planes = Planes::build_plane_from_matrix4(gpu.camera.make_camera());
 
                 let new_matrix: [[f32; 4]; 4] = gpu.camera.make_camera().into();
                 gpu.queue.write_buffer(&gpu.camera_buffer, 0, bytemuck::cast_slice(&new_matrix));
