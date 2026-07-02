@@ -9,7 +9,7 @@ use winit::event::{KeyEvent, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{CursorGrabMode, Fullscreen, Window, WindowId};
-use rapier3d::{prelude, parry::query::ShapeCastOptions, pipeline::{QueryPipeline, QueryFilter, PhysicsPipeline},dynamics::{RigidBodySet, RigidBodyBuilder, ImpulseJointSet, MultibodyJointSet, CCDSolver, IslandManager}, geometry::{Group, ColliderBuilder, ColliderSet, InteractionGroups, InteractionTestMode, BroadPhaseBvh, NarrowPhase}, math::Vec3};
+use rapier3d::{control::{KinematicCharacterController, CharacterAutostep, CharacterLength}, pipeline::{QueryFilter, PhysicsPipeline},dynamics::{RigidBodySet, RigidBodyBuilder, ImpulseJointSet, MultibodyJointSet, CCDSolver, IslandManager, IntegrationParameters}, geometry::{Group, ColliderBuilder, ColliderSet, InteractionGroups, InteractionTestMode, BroadPhaseBvh, NarrowPhase}, math::Vec3};
 
 const DYN: Group = Group::GROUP_1;
 const STA: Group = Group::GROUP_2;
@@ -164,12 +164,56 @@ struct Collision {
     cs: ColliderSet,
     char_handle: RigidBodyHandle,
     physics_pipeline: PhysicsPipeline,
+    gravity: Vec3,
+    integration: IntegrationParameters,
     island_manager: IslandManager,
     broad_phasebvh: BroadPhaseBvh,
     narrow_phase: NarrowPhase,
     ccd_solver: CCDSolver,
     impulse_joint: ImpulseJointSet,
     multi_body_joint: MultibodyJointSet,
+    char_controller: KinematicCharacterController,
+    v_fall: f32,
+}
+
+impl Collision {
+    fn update_check_collision(&mut self, dt: f32, desire_movement: &Vector3<f32>, speed: f32) -> Point3<f32> {
+        let char_data = &self.rbs[self.char_handle];
+        let char_collider_handle = char_data.colliders()[0];
+        let (character_shape, character_pos) = (&self.cs[char_collider_handle].shape(), char_data.position());
+        let query_pipeline = self.broad_phasebvh.as_query_pipeline(
+            self.narrow_phase.query_dispatcher(),
+        &self.rbs, &self.cs, QueryFilter::default().exclude_collider(char_collider_handle));
+
+        let movement_result = self.char_controller.move_shape(dt,
+            &query_pipeline, *character_shape, 
+            character_pos, 
+            Vec3::new(desire_movement.x, desire_movement.y, desire_movement.z) * speed * dt,
+            |_|()
+        );
+
+        self.physics_pipeline.step(self.gravity, &self.integration,
+        &mut self.island_manager, &mut self.broad_phasebvh,
+        &mut self.narrow_phase, &mut self.rbs, &mut self.cs,
+        &mut self.impulse_joint, &mut self.multi_body_joint, &mut self.ccd_solver,
+        &(), &());
+
+        /*  TWO SIDES INTERACT ONLY
+        self.char_controller.solve_character_collision_impulses(
+            dt,
+            &mut query_pipeline_mut, 
+            *character_shape, 4.0, 
+            movement_result.collision,
+        );
+        */
+        if movement_result.grounded {
+            self.v_fall = 0.0;
+        }
+        let mut rb = &mut self.rbs[self.char_handle];
+        let new_pos = rb.position().translation + movement_result.translation;
+        rb.set_next_kinematic_translation(new_pos);
+        Point3::new(new_pos.x, new_pos.y, new_pos.z)
+    }
 }
 
 struct WgpuCtx {
@@ -221,62 +265,25 @@ fn load_static_collider(primitive: &Primitive, rbs: &mut RigidBodySet, cs: &mut 
     cs.insert_with_parent(collider, rb_handle, rbs);
 }
 
-fn load_player_collision(pos: &[f32; 3], rbs: &mut RigidBodySet, cs: &mut ColliderSet) -> RigidBodyHandle {
+fn load_player_collision(pos: &[f32; 3], rbs: &mut RigidBodySet, cs: &mut ColliderSet) -> (RigidBodyHandle, KinematicCharacterController) {
     let dyn_group = InteractionGroups::new(DYN, STA, InteractionTestMode::Or);
-    let rb = RigidBodyBuilder::kinematic_velocity_based()
+    let rb = RigidBodyBuilder::kinematic_position_based()
     .translation(Vec3::new(pos[0], pos[1], pos[2])).build();
     let rb_handle = rbs.insert(rb);
 
-    let collider = ColliderBuilder::capsule_y(1.0, 0.5)
+    let collider = ColliderBuilder::capsule_y(2.0, 0.3)
     .collision_groups(dyn_group)
     .build();
     cs.insert_with_parent(collider, rb_handle, rbs);
-    rb_handle
-}
+    let mut char_controller = KinematicCharacterController::default();
+    char_controller.autostep = Some(CharacterAutostep { 
+        max_height: CharacterLength::Absolute(0.5),
+        min_width: CharacterLength::Absolute(0.2),
+        include_dynamic_bodies: true,
+    });
+    char_controller.snap_to_ground = Some(CharacterLength::Relative(10.0));
 
-fn update_velocity_collision(
-    mut vel: Vector3<f32>,
-    char_handle: RigidBodyHandle,
-    rbs: &mut RigidBodySet,
-    cs: &mut ColliderSet,
-    query_pipeline: &QueryPipeline,
-    dt: f32
-) {
-    let char_data = &rbs[char_handle];
-    let char_collider_handle = char_data.colliders()[0];
-    let char_collider = &cs[char_collider_handle];
-    
-    let mut cur_pos = char_data.position();
-    let char_shape = char_collider.shape();
-    let char_group = char_collider.collision_groups();
-    let options = ShapeCastOptions {
-        max_time_of_impact: dt,
-        target_distance: 0.02,
-        stop_at_penetration: true,
-        compute_impact_geometry_on_penetration: false,
-    };
-
-    let mut time_left = dt;
-    for _ in 0..3 {
-        if time_left < 0.0001 {break};
-        let movement = vel * time_left;
-        let distance = movement.magnitude();
-        if distance < 0.0001 {break};
-
-        if let Some((_collider_handle, hit)) = query_pipeline.cast_shape(
-            cur_pos,
-            Vec3::new(vel.x, vel.y, vel.z), 
-            char_shape,
-            options
-        ) {
-            let normal = Vector3::new(hit.normal1.x, hit.normal1.y, hit.normal1.z);
-            let vn = dot(vel, normal);
-            if vn < 0.0 {
-                vel -= normal * vn;
-            }
-            time_left = 1.0 * hit.time_of_impact;
-        }
-    }
+    (rb_handle, char_controller)
 }
 
 fn convert_aabb_from_matrix(min: Vector3<f32>, max: Vector3<f32>, matrix: Matrix4<f32>) -> ([f32;3], [f32;3], Vector3<f32>, Vector3<f32>) {
@@ -475,7 +482,6 @@ fn load_model(
                         texture_id,
                         mmbg,
                     });
-                    println!("{pris:#?}");
 
                     all_verticles.extend(verticle);
                     all_indices.extend(indices);
@@ -609,6 +615,8 @@ impl ApplicationHandler for MyApp {
             // load static collision
             let mut rbs = RigidBodySet::new();
             let mut cs = ColliderSet::new();
+            let gravity = Vec3::new(0.0, 0.0, 0.0);
+            let integration = IntegrationParameters::default();
             let mut physics_pipeline = PhysicsPipeline::new();
             let mut island_manager = IslandManager::new();
             let mut broad_phasebvh = BroadPhaseBvh::new();
@@ -616,6 +624,12 @@ impl ApplicationHandler for MyApp {
             let mut ccd_solver = CCDSolver::new();
             let mut impulse_joint = ImpulseJointSet::new();
             let mut multi_body_joint = MultibodyJointSet::new();
+            let mut query_pipeline_mut = broad_phasebvh.as_query_pipeline_mut(
+                narrow_phase.query_dispatcher(),
+                &mut rbs,
+                &mut cs,
+                QueryFilter::default()
+            );
             for mesh in &meshes {
                 for primitive in &mesh.primitves {
                     load_static_collider(&primitive, &mut rbs, &mut cs);
@@ -634,13 +648,15 @@ impl ApplicationHandler for MyApp {
                 pitch: 0.0,
             };
 
-            let char_handle = load_player_collision(&camera.eye.into(), &mut rbs, &mut cs);
-            let collision = Collision { 
-                rbs, cs, char_handle,
+            let (char_handle, char_controller) = load_player_collision(&camera.eye.into(), &mut rbs, &mut cs);
+            // DEFINE iodghvweiugfhwruehfjireughenrfvewfu8g9w4tu3jgrughvfwe 💔
+            let collision = Collision {
+                rbs, cs, char_handle, integration, gravity,
                 physics_pipeline, island_manager, broad_phasebvh,
                 narrow_phase, ccd_solver, impulse_joint, multi_body_joint,
+                char_controller, v_fall: 0.0,
             };
-
+            
             let camera_uniform = UniformCamera {
                 uniform: camera.make_camera().into(),
             };
@@ -799,10 +815,10 @@ impl ApplicationHandler for MyApp {
                 let is_pressed = state.is_pressed();
                 if let Some(input) = &mut self.input {
                     match key {
-                        KeyCode::KeyW => input.w = is_pressed,
-                        KeyCode::KeyS => input.s = is_pressed,
-                        KeyCode::KeyA => input.a = is_pressed,
-                        KeyCode::KeyD => input.d = is_pressed,
+                        KeyCode::KeyW | KeyCode::ArrowUp => input.w = is_pressed,
+                        KeyCode::KeyS | KeyCode::ArrowDown => input.s = is_pressed,
+                        KeyCode::KeyA | KeyCode::ArrowLeft => input.a = is_pressed,
+                        KeyCode::KeyD | KeyCode::ArrowRight => input.d = is_pressed,
                         KeyCode::KeyQ => input.q = is_pressed,
                         KeyCode::KeyE => input.e = is_pressed,
                         _ => (),
@@ -929,13 +945,13 @@ impl ApplicationHandler for MyApp {
             win.request_redraw();
 
             if let (Some(gpu), Some(input)) = (&mut self.gpu_ctx, &self.input) {
-                let time = Instant::now();
+                let collision = &mut gpu.collision;
                 let forward = gpu.camera.update_target();
                 let forward_flat = Vector3::new(forward.x, 0.0, forward.z).normalize();
                 let right = forward_flat.cross(gpu.camera.up);
                 let mut velocity = Vector3::new(0.0, 0.0, 0.0);
                 let speed = 4.0;
-
+                
                 if input.w {
                     velocity += forward_flat
                 }
@@ -955,10 +971,9 @@ impl ApplicationHandler for MyApp {
                     velocity.y += 1.0
                 }
 
-                if velocity.magnitude2() > 0.0 {
-                    gpu.camera.eye += velocity.normalize() * speed * dt;
-                    gpu.camera.update_target();
-                }
+                let new_pos = collision.update_check_collision(dt, &velocity.normalize(), speed);
+                gpu.camera.eye = new_pos;
+                gpu.camera.update_target();
                 gpu.camera_planes = Planes::build_plane_from_matrix4(gpu.camera.make_camera());
 
                 let new_matrix: [[f32; 4]; 4] = gpu.camera.make_camera().into();
