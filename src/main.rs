@@ -1,5 +1,18 @@
-use cgmath::{Deg, InnerSpace, Matrix4, Point3, Vector3, Vector4, Quaternion, dot};
+use cgmath::{Deg, InnerSpace, Matrix4, Point3, Quaternion, Vector3, Vector4, dot};
 use rapier3d::dynamics::RigidBodyHandle;
+use rapier3d::{
+    control::{CharacterAutostep, CharacterLength, KinematicCharacterController},
+    dynamics::{
+        CCDSolver, ImpulseJointSet, IntegrationParameters, IslandManager, MultibodyJointSet,
+        RigidBodyBuilder, RigidBodySet,
+    },
+    geometry::{
+        BroadPhaseBvh, ColliderBuilder, ColliderSet, Group, InteractionGroups, InteractionTestMode,
+        NarrowPhase,
+    },
+    math::Vec3,
+    pipeline::{PhysicsPipeline, QueryFilter},
+};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -9,7 +22,7 @@ use winit::event::{KeyEvent, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{CursorGrabMode, Fullscreen, Window, WindowId};
-use rapier3d::{control::{KinematicCharacterController, CharacterAutostep, CharacterLength}, pipeline::{QueryFilter, PhysicsPipeline},dynamics::{RigidBodySet, RigidBodyBuilder, ImpulseJointSet, MultibodyJointSet, CCDSolver, IslandManager, IntegrationParameters}, geometry::{Group, ColliderBuilder, ColliderSet, InteractionGroups, InteractionTestMode, BroadPhaseBvh, NarrowPhase}, math::Vec3};
+mod helper;
 
 const DYN: Group = Group::GROUP_1;
 const STA: Group = Group::GROUP_2;
@@ -18,6 +31,20 @@ const STA: Group = Group::GROUP_2;
 struct Plane {
     normal: [f32; 3],
     d: f32,
+}
+
+struct UI {
+    egui_ctx: egui::Context,
+    egui_winit_state: egui_winit::State,
+    egui_renderer: egui_wgpu::Renderer,
+    should_draw: bool,
+}
+
+enum GameState {
+    Menu,
+    Play,
+    Settings,
+    Exit,
 }
 
 struct Planes {
@@ -84,6 +111,7 @@ struct InputState {
     d: bool,
     q: bool,
     e: bool,
+    shift: bool,
 }
 
 struct Camera {
@@ -159,6 +187,10 @@ struct Meshes {
     textures: Vec<Texture>,
 }
 
+struct Scene {
+    meshes: Vec<Meshes>,
+}
+
 struct Collision {
     rbs: RigidBodySet,
     cs: ColliderSet,
@@ -177,42 +209,60 @@ struct Collision {
 }
 
 impl Collision {
-    fn update_check_collision(&mut self, dt: f32, desire_movement: &Vector3<f32>, speed: f32) -> Point3<f32> {
+    fn update_check_collision(
+        &mut self,
+        dt: f32,
+        desire_movement: &Vector3<f32>,
+        speed: f32,
+    ) -> Point3<f32> {
         let char_data = &self.rbs[self.char_handle];
         let char_collider_handle = char_data.colliders()[0];
-        let (character_shape, character_pos) = (&self.cs[char_collider_handle].shape(), char_data.position());
+        let (character_shape, character_pos) =
+            (&self.cs[char_collider_handle].shape(), char_data.position());
         let query_pipeline = self.broad_phasebvh.as_query_pipeline(
             self.narrow_phase.query_dispatcher(),
-        &self.rbs, &self.cs, QueryFilter::default().exclude_collider(char_collider_handle));
-
-        let movement_result = self.char_controller.move_shape(dt,
-            &query_pipeline, *character_shape, 
-            character_pos, 
-            Vec3::new(desire_movement.x, desire_movement.y, desire_movement.z) * speed * dt,
-            |_|()
+            &self.rbs,
+            &self.cs,
+            QueryFilter::default().exclude_collider(char_collider_handle),
         );
 
-        self.physics_pipeline.step(self.gravity, &self.integration,
-        &mut self.island_manager, &mut self.broad_phasebvh,
-        &mut self.narrow_phase, &mut self.rbs, &mut self.cs,
-        &mut self.impulse_joint, &mut self.multi_body_joint, &mut self.ccd_solver,
-        &(), &());
+        let movement_result = self.char_controller.move_shape(
+            dt,
+            &query_pipeline,
+            *character_shape,
+            character_pos,
+            Vec3::new(desire_movement.x, desire_movement.y, desire_movement.z) * speed * dt,
+            |_| (),
+        );
+
+        self.physics_pipeline.step(
+            self.gravity,
+            &self.integration,
+            &mut self.island_manager,
+            &mut self.broad_phasebvh,
+            &mut self.narrow_phase,
+            &mut self.rbs,
+            &mut self.cs,
+            &mut self.impulse_joint,
+            &mut self.multi_body_joint,
+            &mut self.ccd_solver,
+            &(),
+            &(),
+        );
 
         /*  TWO SIDES INTERACT ONLY
         self.char_controller.solve_character_collision_impulses(
             dt,
-            &mut query_pipeline_mut, 
-            *character_shape, 4.0, 
+            &mut query_pipeline_mut,
+            *character_shape, 4.0,
             movement_result.collision,
         );
         */
-        if movement_result.grounded {
-            self.v_fall = 0.0;
-        }
+
         let mut rb = &mut self.rbs[self.char_handle];
         let new_pos = rb.position().translation + movement_result.translation;
         rb.set_next_kinematic_translation(new_pos);
-        Point3::new(new_pos.x, new_pos.y, new_pos.z)
+        Point3::new(new_pos.x, new_pos.y + 2.25, new_pos.z)
     }
 }
 
@@ -226,9 +276,30 @@ struct WgpuCtx {
     camera_buffer: wgpu::Buffer,
     camera: Camera,
     camera_planes: Planes,
-    meshes: Vec<Meshes>,
+    scene: Scene,
     depth_view: wgpu::TextureView,
     collision: Collision,
+    ui: UI,
+    game_state: GameState,
+    playing: bool,
+    mouse_locked: bool,
+}
+
+fn make_depth_tt(device: &wgpu::Device, config: &wgpu::SurfaceConfiguration) -> wgpu::Texture {
+    device.create_texture(&wgpu::TextureDescriptor {
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Depth32Float,
+        label: Some("depth tt"),
+        mip_level_count: 1,
+        sample_count: 1,
+        size: wgpu::Extent3d {
+            height: config.height,
+            width: config.width,
+            depth_or_array_layers: 1,
+        },
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        view_formats: &[wgpu::TextureFormat::Depth32Float],
+    })
 }
 
 #[derive(Default)]
@@ -237,7 +308,7 @@ struct MyApp {
     gpu_ctx: Option<WgpuCtx>,
     last_time: Option<Instant>,
     input: Option<InputState>,
-    mouse_locked: bool,
+    fps: f32,
 }
 
 impl MyApp {
@@ -256,43 +327,54 @@ fn load_static_collider(primitive: &Primitive, rbs: &mut RigidBodySet, cs: &mut 
     let extent = primitive.extent;
     let center = primitive.center;
     let rb = RigidBodyBuilder::fixed()
-    .translation(Vec3::new(center.x, center.y, center.z)).build();
+        .translation(Vec3::new(center.x, center.y, center.z))
+        .build();
+    let mut offset = 0.1;
 
-    let collider = ColliderBuilder::cuboid(extent.x, extent.y, extent.z)
-    .collision_groups(static_group)
-    .build();
+    let collider = ColliderBuilder::cuboid(extent.x + offset, extent.y + offset, extent.z + offset)
+        .collision_groups(static_group)
+        .build();
     let rb_handle = rbs.insert(rb);
     cs.insert_with_parent(collider, rb_handle, rbs);
 }
 
-fn load_player_collision(pos: &[f32; 3], rbs: &mut RigidBodySet, cs: &mut ColliderSet) -> (RigidBodyHandle, KinematicCharacterController) {
+fn load_player_collision(
+    pos: &[f32; 3],
+    rbs: &mut RigidBodySet,
+    cs: &mut ColliderSet,
+) -> (RigidBodyHandle, KinematicCharacterController) {
     let dyn_group = InteractionGroups::new(DYN, STA, InteractionTestMode::Or);
     let rb = RigidBodyBuilder::kinematic_position_based()
-    .translation(Vec3::new(pos[0], pos[1], pos[2])).build();
+        .translation(Vec3::new(pos[0], pos[1], pos[2]))
+        .build();
     let rb_handle = rbs.insert(rb);
 
-    let collider = ColliderBuilder::capsule_y(2.0, 0.3)
-    .collision_groups(dyn_group)
-    .build();
+    let collider = ColliderBuilder::capsule_y(2.25, 0.3)
+        .collision_groups(dyn_group)
+        .build();
     cs.insert_with_parent(collider, rb_handle, rbs);
     let mut char_controller = KinematicCharacterController::default();
-    char_controller.autostep = Some(CharacterAutostep { 
+    char_controller.autostep = Some(CharacterAutostep {
         max_height: CharacterLength::Absolute(0.5),
         min_width: CharacterLength::Absolute(0.2),
         include_dynamic_bodies: true,
     });
-    char_controller.snap_to_ground = Some(CharacterLength::Relative(10.0));
+    char_controller.snap_to_ground = Some(CharacterLength::Absolute(0.5));
 
     (rb_handle, char_controller)
 }
 
-fn convert_aabb_from_matrix(min: Vector3<f32>, max: Vector3<f32>, matrix: Matrix4<f32>) -> ([f32;3], [f32;3], Vector3<f32>, Vector3<f32>) {
+fn convert_aabb_from_matrix(
+    min: Vector3<f32>,
+    max: Vector3<f32>,
+    matrix: Matrix4<f32>,
+) -> ([f32; 3], [f32; 3], Vector3<f32>, Vector3<f32>) {
     let old_extent = (max - min) * 0.5;
     let old_center = (min + max) * 0.5;
     let center4 = matrix * Vector4::new(old_center.x, old_center.y, old_center.z, 1.0);
     let center = Vector3::new(center4.x, center4.y, center4.z);
 
-    let mut extent = Vector3::new(0.0,0.0,0.0);
+    let mut extent = Vector3::new(0.0, 0.0, 0.0);
     for i in 0..3 {
         for j in 0..3 {
             extent[i] += matrix[j][i] * old_extent[i];
@@ -324,12 +406,26 @@ fn load_model(
     for scene in document.scenes() {
         for node in scene.nodes() {
             // matrix model
-            let model_matrix: [[f32; 4]; 4]  = match node.transform() {
+            let model_matrix: [[f32; 4]; 4] = match node.transform() {
                 gltf::scene::Transform::Matrix { matrix } => matrix,
-                gltf::scene::Transform::Decomposed { translation, rotation, scale } => {
-                    let t: Matrix4<f32> = Matrix4::from_translation(Vector3::new(translation[0], translation[1], translation[2]));
-                    let r: Matrix4<f32> = Matrix4::from(Quaternion::new(rotation[3], rotation[0], rotation[1], rotation[2]));
-                    let s: Matrix4<f32> = Matrix4::from_nonuniform_scale(scale[0], scale[1], scale[2]);
+                gltf::scene::Transform::Decomposed {
+                    translation,
+                    rotation,
+                    scale,
+                } => {
+                    let t: Matrix4<f32> = Matrix4::from_translation(Vector3::new(
+                        translation[0],
+                        translation[1],
+                        translation[2],
+                    ));
+                    let r: Matrix4<f32> = Matrix4::from(Quaternion::new(
+                        rotation[3],
+                        rotation[0],
+                        rotation[1],
+                        rotation[2],
+                    ));
+                    let s: Matrix4<f32> =
+                        Matrix4::from_nonuniform_scale(scale[0], scale[1], scale[2]);
                     (t * r * s).into()
                 }
             };
@@ -341,8 +437,8 @@ fn load_model(
             });
 
             let model_matrix_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label:  Some("model matrix"), 
-                layout: &model_matrix_layout, 
+                label: Some("model matrix"),
+                layout: &model_matrix_layout,
                 entries: &[wgpu::BindGroupEntry {
                     binding: 0,
                     resource: model_matrix_buffer.as_entire_binding(),
@@ -358,7 +454,11 @@ fn load_model(
                         serde_json::from_value(mi.clone()).expect("cant extract min");
                     let max_raw: [f32; 3] =
                         serde_json::from_value(ma.clone()).expect("cant extract min");
-                    let (min, max, center, extent) = convert_aabb_from_matrix(min_raw.into(), max_raw.into(), model_matrix.into());
+                    let (min, max, center, extent) = convert_aabb_from_matrix(
+                        min_raw.into(),
+                        max_raw.into(),
+                        model_matrix.into(),
+                    );
 
                     // texture
                     let material = primitive.material();
@@ -415,9 +515,9 @@ fn load_model(
                         );
                         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
                         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-                            address_mode_u: wgpu::AddressMode::ClampToEdge,
-                            address_mode_v: wgpu::AddressMode::ClampToEdge,
-                            address_mode_w: wgpu::AddressMode::ClampToEdge,
+                            address_mode_u: wgpu::AddressMode::Repeat,
+                            address_mode_v: wgpu::AddressMode::Repeat,
+                            address_mode_w: wgpu::AddressMode::Repeat,
                             ..Default::default()
                         });
                         let texture_bind_group =
@@ -510,7 +610,7 @@ fn load_model(
 
 // break line <------------------------------------------------------------------------------------>
 impl WgpuCtx {
-    pub fn get_frame_view(&self) -> Option<(wgpu::SurfaceTexture, wgpu::TextureView)> {
+    fn get_frame_view(&self) -> Option<(wgpu::SurfaceTexture, wgpu::TextureView)> {
         let frame_enum = self.surface.get_current_texture();
         match frame_enum {
             wgpu::CurrentSurfaceTexture::Success(frame) => {
@@ -522,6 +622,200 @@ impl WgpuCtx {
             }
             _ => None,
         }
+    }
+
+    fn update_ui_menu(
+        &mut self,
+        win: &Window,
+        mut encoder: &mut wgpu::CommandEncoder,
+    ) -> (
+        std::vec::Vec<egui::ClippedPrimitive>,
+        egui_wgpu::ScreenDescriptor,
+        std::vec::Vec<egui::TextureId>,
+    ) {
+        let paint_jobs;
+        let screen_descriptor;
+        let texture_ui;
+        {
+            let ui = &mut self.ui;
+            let raw_input = ui.egui_winit_state.take_egui_input(&win);
+            ui.egui_ctx.begin_pass(raw_input);
+            egui::Window::new("ok")
+                .title_bar(false)
+                .resizable(true)
+                .collapsible(false)
+                .fixed_size(egui::vec2(1000.0, 1000.0))
+                .frame(
+                    egui::Frame::window(&ui.egui_ctx.global_style())
+                        .fill(egui::Color32::from_rgba_unmultiplied(0, 0, 0, 0))
+                        .stroke(egui::Stroke::new(
+                            0.0,
+                            egui::Color32::from_rgba_unmultiplied(0, 0, 0, 0),
+                        ))
+                        .corner_radius(0)
+                        .shadow(egui::epaint::Shadow {
+                            offset: [0, 0],
+                            blur: 0,
+                            spread: 0,
+                            color: egui::Color32::from_black_alpha(0),
+                        }),
+                )
+                .anchor(egui::Align2::CENTER_CENTER, egui::vec2(-500.0, -300.0))
+                .show(&ui.egui_ctx, |egui| {
+                    egui.add_space(50.0);
+                    egui.label(
+                        egui::RichText::new("NoGAmE")
+                            .font(egui::FontId::monospace(150.0))
+                            .strong()
+                            .color(egui::Color32::from_rgba_unmultiplied(210, 20, 20, 180)),
+                    );
+                    egui.add_space(150.0);
+
+                    // play
+                    if helper::layout_but_ui(egui, "Play", "play_but").clicked() {
+                        self.game_state = GameState::Play;
+                        self.playing = true;
+                        win.set_cursor_visible(false);
+                        let _ = win.set_cursor_grab(CursorGrabMode::Locked);
+                        self.mouse_locked = true;
+                    };
+                    // set
+                    if helper::layout_but_ui(egui, "Settings", "settings_but").clicked() {
+                        self.game_state = GameState::Settings
+                    };
+                    egui.add_space(50.0);
+                    // ext
+                    if helper::layout_but_ui(egui, "Exit", "exit_but").clicked() {
+                        self.game_state = GameState::Exit
+                    };
+                });
+
+            let ui_data = ui.egui_ctx.end_pass();
+
+            for (id, texture) in &ui_data.textures_delta.set {
+                ui.egui_renderer
+                    .update_texture(&self.device, &self.queue, *id, texture);
+            }
+            texture_ui = ui_data.textures_delta.free.clone();
+            ui.egui_winit_state
+                .handle_platform_output(&win, ui_data.platform_output);
+            paint_jobs = ui
+                .egui_ctx
+                .tessellate(ui_data.shapes, ui_data.pixels_per_point);
+            screen_descriptor = egui_wgpu::ScreenDescriptor {
+                size_in_pixels: [self.config.width, self.config.height],
+                pixels_per_point: ui_data.pixels_per_point,
+            };
+            ui.egui_renderer.update_buffers(
+                &self.device,
+                &self.queue,
+                &mut encoder,
+                &paint_jobs,
+                &screen_descriptor,
+            );
+        }
+        (paint_jobs, screen_descriptor, texture_ui)
+    }
+
+    fn update_ui_settings(
+        &mut self,
+        win: &Window,
+        mut encoder: &mut wgpu::CommandEncoder,
+    ) -> (
+        std::vec::Vec<egui::ClippedPrimitive>,
+        egui_wgpu::ScreenDescriptor,
+        std::vec::Vec<egui::TextureId>,
+    ) {
+        let paint_jobs;
+        let screen_descriptor;
+        let texture_ui;
+        {
+            let ui = &mut self.ui;
+            let raw_input = ui.egui_winit_state.take_egui_input(&win);
+            ui.egui_ctx.begin_pass(raw_input);
+            egui::Window::new("ok")
+                .title_bar(false)
+                .resizable(true)
+                .collapsible(false)
+                .fixed_size(egui::vec2(1000.0, 1000.0))
+                .frame(
+                    egui::Frame::window(&ui.egui_ctx.global_style())
+                        .fill(egui::Color32::from_rgba_unmultiplied(0, 0, 0, 0))
+                        .stroke(egui::Stroke::new(
+                            0.0,
+                            egui::Color32::from_rgba_unmultiplied(0, 0, 0, 0),
+                        ))
+                        .corner_radius(0)
+                        .shadow(egui::epaint::Shadow {
+                            offset: [0, 0],
+                            blur: 0,
+                            spread: 0,
+                            color: egui::Color32::from_black_alpha(0),
+                        }),
+                )
+                .anchor(egui::Align2::CENTER_CENTER, egui::vec2(-410.0, -300.0))
+                .show(&ui.egui_ctx, |egui| {
+                    egui.add_space(50.0);
+                    egui.label(
+                        egui::RichText::new("Settings")
+                            .font(egui::FontId::monospace(150.0))
+                            .strong()
+                            .color(egui::Color32::from_rgba_unmultiplied(210, 20, 20, 180)),
+                    );
+                    egui.add_space(150.0);
+
+                    // fov
+                    let (fov, fov_val) = helper::layout_sld_ui(egui, "Fov", &mut self.camera.fov, "fov", 30..120);
+                    if fov.changed() {
+                        self.camera.fov = fov_val;
+                    };
+                    egui.add_space(5.0);
+                    // sound (deadcode)
+                    let (sound, sound_val) = helper::layout_sld_ui(egui, "Sound", &mut 50.0, "sound", 0..100);
+                    if sound.changed() {
+                        println!("Sound changed to: {sound_val}");
+                    };
+                    egui.add_space(20.0);
+                    // fps editor
+                    egui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("FPS")
+                            .color(egui::Color32::WHITE)
+                            .font(egui::FontId::monospace(20.0))
+                        );
+                        
+                    });
+                    egui.add_space(40.0);
+                    // ext
+                    if helper::layout_but_ui(egui, "Back", "back_but").clicked() {
+                        self.game_state = GameState::Menu
+                    };
+                });
+
+            let ui_data = ui.egui_ctx.end_pass();
+
+            for (id, texture) in &ui_data.textures_delta.set {
+                ui.egui_renderer
+                    .update_texture(&self.device, &self.queue, *id, texture);
+            }
+            texture_ui = ui_data.textures_delta.free.clone();
+            ui.egui_winit_state
+                .handle_platform_output(&win, ui_data.platform_output);
+            paint_jobs = ui
+                .egui_ctx
+                .tessellate(ui_data.shapes, ui_data.pixels_per_point);
+            screen_descriptor = egui_wgpu::ScreenDescriptor {
+                size_in_pixels: [self.config.width, self.config.height],
+                pixels_per_point: ui_data.pixels_per_point,
+            };
+            ui.egui_renderer.update_buffers(
+                &self.device,
+                &self.queue,
+                &mut encoder,
+                &paint_jobs,
+                &screen_descriptor,
+            );
+        }
+        (paint_jobs, screen_descriptor, texture_ui)
     }
 }
 
@@ -588,7 +882,7 @@ impl ApplicationHandler for MyApp {
                     ],
                 });
 
-                let camera_bind_group_layout =
+            let camera_bind_group_layout =
                 device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                     label: Some("camera and model Layout"),
                     entries: &[wgpu::BindGroupLayoutEntry {
@@ -605,11 +899,18 @@ impl ApplicationHandler for MyApp {
 
             let mut meshes: Vec<Meshes> = Vec::new();
 
-            let paths = ["./src/ok.glb"];
+            let paths = ["./src/_.glb"];
             // for path in paths later.. and meshes[i] *for each* file gltf loaded
             for path in paths {
-                meshes.extend(load_model(path, &device, &queue, &texture_layout, &camera_bind_group_layout));
+                meshes.extend(load_model(
+                    path,
+                    &device,
+                    &queue,
+                    &texture_layout,
+                    &camera_bind_group_layout,
+                ));
             }
+            let scene = Scene {meshes};
             // end for return vec
 
             // load static collision
@@ -628,35 +929,73 @@ impl ApplicationHandler for MyApp {
                 narrow_phase.query_dispatcher(),
                 &mut rbs,
                 &mut cs,
-                QueryFilter::default()
+                QueryFilter::default(),
             );
-            for mesh in &meshes {
+            for mesh in &scene.meshes {
                 for primitive in &mesh.primitves {
                     load_static_collider(&primitive, &mut rbs, &mut cs);
                 }
             }
 
+            // egui
+            let egui_ctx = egui::Context::default();
+            let egui_winit_state = egui_winit::State::new(
+                egui_ctx.clone(),
+                egui::ViewportId::ROOT,
+                &window,
+                None,
+                None,
+                None,
+            );
+            let egui_renderer = egui_wgpu::Renderer::new(
+                &device,
+                config.format,
+                egui_wgpu::RendererOptions {
+                    msaa_samples: 1,
+                    depth_stencil_format: Some(wgpu::TextureFormat::Depth32Float),
+                    dithering: true,
+                    predictable_texture_filtering: false,
+                },
+            );
+            let ui = UI {
+                egui_ctx,
+                egui_winit_state,
+                egui_renderer,
+                should_draw: false,
+            };
+
             let camera = Camera {
-                eye: (0.0, 2.0, 5.0).into(),
+                eye: (0.0, 2.25, 5.0).into(),
                 target: (0.0, 0.0, 0.0).into(),
                 up: Vector3::unit_y(),
                 aspect: config.width as f32 / config.height as f32,
                 fov: 75.0,
-                near: 0.1,
-                far: 100.0,
+                near: 0.01,
+                far: 75.0,
                 yaw: -90.0,
                 pitch: 0.0,
             };
 
-            let (char_handle, char_controller) = load_player_collision(&camera.eye.into(), &mut rbs, &mut cs);
+            let (char_handle, char_controller) =
+                load_player_collision(&camera.eye.into(), &mut rbs, &mut cs);
             // DEFINE iodghvweiugfhwruehfjireughenrfvewfu8g9w4tu3jgrughvfwe 💔
             let collision = Collision {
-                rbs, cs, char_handle, integration, gravity,
-                physics_pipeline, island_manager, broad_phasebvh,
-                narrow_phase, ccd_solver, impulse_joint, multi_body_joint,
-                char_controller, v_fall: 0.0,
+                rbs,
+                cs,
+                char_handle,
+                integration,
+                gravity,
+                physics_pipeline,
+                island_manager,
+                broad_phasebvh,
+                narrow_phase,
+                ccd_solver,
+                impulse_joint,
+                multi_body_joint,
+                char_controller,
+                v_fall: 0.0,
             };
-            
+
             let camera_uniform = UniformCamera {
                 uniform: camera.make_camera().into(),
             };
@@ -673,7 +1012,11 @@ impl ApplicationHandler for MyApp {
 
             let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("pipeline layout"),
-                bind_group_layouts: &[Some(&camera_bind_group_layout), Some(&texture_layout), Some(&camera_bind_group_layout)],
+                bind_group_layouts: &[
+                    Some(&camera_bind_group_layout),
+                    Some(&texture_layout),
+                    Some(&camera_bind_group_layout),
+                ],
                 ..Default::default()
             });
 
@@ -730,21 +1073,10 @@ impl ApplicationHandler for MyApp {
                 }],
             });
 
-            let depth_texture = device.create_texture(&wgpu::TextureDescriptor {
-                label: Some("depth tt"),
-                format: wgpu::TextureFormat::Depth32Float,
-                dimension: wgpu::TextureDimension::D2,
-                mip_level_count: 1,
-                sample_count: 1,
-                size: wgpu::Extent3d {
-                    width: config.width,
-                    height: config.height,
-                    depth_or_array_layers: 1,
-                },
-                usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-                view_formats: &[wgpu::TextureFormat::Depth32Float],
-            });
+            let depth_texture = make_depth_tt(&device, &config);
             let depth_view = depth_texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+            let game_state = GameState::Menu;
 
             WgpuCtx {
                 surface,
@@ -755,10 +1087,14 @@ impl ApplicationHandler for MyApp {
                 camera_bind_group,
                 camera_buffer,
                 camera,
-                meshes,
+                scene,
                 camera_planes,
                 depth_view,
                 collision,
+                ui,
+                game_state,
+                playing: false,
+                mouse_locked: false,
             }
         });
 
@@ -766,142 +1102,217 @@ impl ApplicationHandler for MyApp {
         self.window = Some(window);
         self.gpu_ctx = Some(gpu_ctx);
         self.last_time = Some(Instant::now());
-        self.mouse_locked = false;
+        self.fps = 60.0;
     }
-
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _: WindowId, event: WindowEvent) {
-        match event {
-            WindowEvent::KeyboardInput {
-                event:
-                    KeyEvent {
-                        physical_key: PhysicalKey::Code(KeyCode::Escape),
-                        state,
+        if let Some(gpu) = &mut self.gpu_ctx {
+            let state = &mut gpu.ui.egui_winit_state;
+            let res = state.on_window_event(&self.window.as_deref().unwrap(), &event);
+            let consumed = match gpu.game_state {
+                GameState::Play => {gpu.ui.should_draw = true; false},
+                _ => {res.consumed},
+            };
+            if consumed {
+                if res.repaint { gpu.ui.should_draw = true; } else {gpu.ui.should_draw = false};
+                return;
+            } else {
+                match event {
+                    WindowEvent::KeyboardInput {
+                        event:
+                            KeyEvent {
+                                physical_key: PhysicalKey::Code(KeyCode::Escape),
+                                state,
+                                ..
+                            },
                         ..
-                    },
-                ..
-            } => {
-                if self.mouse_locked && state.is_pressed() {
-                    if let Some(win) = &self.window {
-                        win.set_cursor_visible(true);
-                        let _ = win.set_cursor_grab(CursorGrabMode::None);
-                        self.mouse_locked = false;
-                    }
-                }
-            }
-
-            WindowEvent::MouseInput {
-                state: winit::event::ElementState::Pressed,
-                button: winit::event::MouseButton::Left,
-                ..
-            } => {
-                if !self.mouse_locked {
-                    if let Some(win) = &self.window {
-                        win.set_cursor_visible(false);
-                        let _ = win.set_cursor_grab(CursorGrabMode::Locked);
-                        self.mouse_locked = true;
-                    }
-                }
-            }
-
-            WindowEvent::KeyboardInput {
-                event:
-                    KeyEvent {
-                        physical_key: PhysicalKey::Code(key),
-                        state,
-                        ..
-                    },
-                ..
-            } => {
-                let is_pressed = state.is_pressed();
-                if let Some(input) = &mut self.input {
-                    match key {
-                        KeyCode::KeyW | KeyCode::ArrowUp => input.w = is_pressed,
-                        KeyCode::KeyS | KeyCode::ArrowDown => input.s = is_pressed,
-                        KeyCode::KeyA | KeyCode::ArrowLeft => input.a = is_pressed,
-                        KeyCode::KeyD | KeyCode::ArrowRight => input.d = is_pressed,
-                        KeyCode::KeyQ => input.q = is_pressed,
-                        KeyCode::KeyE => input.e = is_pressed,
-                        _ => (),
-                    }
-                }
-            }
-
-            WindowEvent::RedrawRequested => {
-                if let (Some(win), Some(gpu)) = (&self.window, &self.gpu_ctx) {
-                    if let Some((frame, view)) = gpu.get_frame_view() {
-                        let mut encoder =
-                            gpu.device
-                                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                                    label: Some("Encoder"),
-                                });
-
-                        {
-                            let mut render_pass =
-                                encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                                    label: Some("render pass"),
-                                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                                        view: &view,
-                                        depth_slice: None,
-                                        resolve_target: None,
-                                        ops: wgpu::Operations {
-                                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                                            store: wgpu::StoreOp::Store,
-                                        },
-                                    })],
-                                    depth_stencil_attachment: Some(
-                                        wgpu::RenderPassDepthStencilAttachment {
-                                            view: &gpu.depth_view,
-                                            depth_ops: Some(wgpu::Operations {
-                                                load: wgpu::LoadOp::Clear(1.0),
-                                                store: wgpu::StoreOp::Store,
-                                            }),
-                                            stencil_ops: None,
-                                        },
-                                    ),
-                                    ..Default::default()
-                                });
-                            render_pass.set_pipeline(&gpu.pipeline);
-                            render_pass.set_bind_group(0, &gpu.camera_bind_group, &[]);
-
-                            for (_, mesh) in gpu.meshes.iter().enumerate() {
-                                render_pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
-                                render_pass.set_index_buffer(
-                                    mesh.index_buffer.slice(..),
-                                    wgpu::IndexFormat::Uint32,
-                                );
-                                let primitives = &mesh.primitves;
-                                for primitive in primitives {
-                                    if gpu
-                                        .camera_planes
-                                        .frustum_culling(primitive.min, primitive.max)
-                                    {
-                                        render_pass.set_bind_group(
-                                            1,
-                                            &mesh.textures[primitive.texture_id].texture,
-                                            &[],
-                                        );
-                                        render_pass.set_bind_group(2, &primitive.mmbg, &[]);
-                                        render_pass.draw_indexed(
-                                            primitive.start..(primitive.start + primitive.count),
-                                            0,
-                                            0..1,
-                                        );
-                                    }
-                                }
+                    } => {
+                        if gpu.mouse_locked && state.is_pressed() && gpu.playing {
+                            if let (Some(win), Some(gpu)) = (&self.window, &mut self.gpu_ctx) {
+                                win.set_cursor_visible(true);
+                                let _ = win.set_cursor_grab(CursorGrabMode::None);
+                                gpu.mouse_locked = false;
+                                gpu.game_state = GameState::Menu;
+                                gpu.playing = false;
+                                println!("unlock");
                             }
                         }
-                        gpu.queue.submit(std::iter::once(encoder.finish()));
-                        frame.present();
                     }
-                } else {
-                    println!("computer forced to run fast but the data?");
+
+                    WindowEvent::Resized(new_size) => {
+                        if let Some(gpu) = &mut self.gpu_ctx {
+                            gpu.config.width = new_size.width;
+                            gpu.config.height = new_size.height;
+                            gpu.surface.configure(&gpu.device, &gpu.config);
+                            gpu.camera.aspect = new_size.width as f32 / new_size.height as f32;
+                            gpu.depth_view = make_depth_tt(&gpu.device, &gpu.config)
+                                .create_view(&wgpu::TextureViewDescriptor::default());
+                        }
+                    }
+
+                    WindowEvent::KeyboardInput {
+                        event:
+                            KeyEvent {
+                                physical_key: PhysicalKey::Code(key),
+                                state,
+                                ..
+                            },
+                        ..
+                    } => {
+                        let is_pressed = state.is_pressed();
+                        if let Some(input) = &mut self.input
+                            && gpu.playing
+                        {
+                            match key {
+                                KeyCode::KeyW | KeyCode::ArrowUp => input.w = is_pressed,
+                                KeyCode::KeyS | KeyCode::ArrowDown => input.s = is_pressed,
+                                KeyCode::KeyA | KeyCode::ArrowLeft => input.a = is_pressed,
+                                KeyCode::KeyD | KeyCode::ArrowRight => input.d = is_pressed,
+                                KeyCode::KeyQ => input.q = is_pressed,
+                                KeyCode::KeyE => input.e = is_pressed,
+                                KeyCode::ShiftLeft | KeyCode::ShiftRight => {
+                                    input.shift = is_pressed
+                                }
+                                _ => (),
+                            }
+                        }
+                    }
+
+                    WindowEvent::RedrawRequested => {
+                        if let (Some(win), Some(gpu)) = (&self.window, &mut self.gpu_ctx) {
+                            if let Some((frame, view)) = gpu.get_frame_view() {
+                                let mut encoder = gpu.device.create_command_encoder(
+                                    &wgpu::CommandEncoderDescriptor {
+                                        label: Some("Encoder"),
+                                    },
+                                );
+
+                                {
+                                    match gpu.game_state {
+                                        // play
+                                        GameState::Play => {
+                                            let mut render_pass = helper::game_pass(
+                                                &mut encoder,
+                                                &view,
+                                                &gpu.depth_view,
+                                            );
+                                            render_pass.set_pipeline(&gpu.pipeline);
+                                            render_pass.set_bind_group(
+                                                0,
+                                                &gpu.camera_bind_group,
+                                                &[],
+                                            );
+                                            for (_, mesh) in gpu.scene.meshes.iter().enumerate() {
+                                                render_pass.set_vertex_buffer(
+                                                    0,
+                                                    mesh.vertex_buffer.slice(..),
+                                                );
+                                                render_pass.set_index_buffer(
+                                                    mesh.index_buffer.slice(..),
+                                                    wgpu::IndexFormat::Uint32,
+                                                );
+                                                let primitives = &mesh.primitves;
+                                                for primitive in primitives {
+                                                    if gpu.camera_planes.frustum_culling(
+                                                        primitive.min,
+                                                        primitive.max,
+                                                    ) {
+                                                        render_pass.set_bind_group(
+                                                            1,
+                                                            &mesh.textures[primitive.texture_id]
+                                                                .texture,
+                                                            &[],
+                                                        );
+                                                        render_pass.set_bind_group(
+                                                            2,
+                                                            &primitive.mmbg,
+                                                            &[],
+                                                        );
+                                                        render_pass.draw_indexed(
+                                                            primitive.start
+                                                                ..(primitive.start
+                                                                    + primitive.count),
+                                                            0,
+                                                            0..1,
+                                                        );
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        // menu
+                                        GameState::Menu => {
+                                            let mut render_pass = helper::menu_pass(
+                                                &mut encoder,
+                                                &view,
+                                                &gpu.depth_view,
+                                            );
+                                            render_pass.set_pipeline(&gpu.pipeline);
+                                            render_pass.set_bind_group(
+                                                0,
+                                                &gpu.camera_bind_group,
+                                                &[],
+                                            );
+                                            let mut static_render_pass =
+                                                render_pass.forget_lifetime();
+                                            let (paint_jobs, screen_descriptor, texture_ui) =
+                                                gpu.update_ui_menu(&win, &mut encoder);
+                                            // render
+                                            gpu.ui.egui_renderer.render(
+                                                &mut static_render_pass,
+                                                &paint_jobs,
+                                                &screen_descriptor,
+                                            );
+                                            for id in texture_ui {
+                                                gpu.ui.egui_renderer.free_texture(&id);
+                                            }
+                                        }
+                                        // ext
+                                        GameState::Exit => {
+                                            event_loop.exit();
+                                            println!("Exit");
+                                        }
+                                        // sets
+                                        GameState::Settings => {
+                                            let mut render_pass = helper::menu_pass(
+                                                &mut encoder,
+                                                &view,
+                                                &gpu.depth_view,
+                                            );
+                                            render_pass.set_pipeline(&gpu.pipeline);
+                                            render_pass.set_bind_group(
+                                                0,
+                                                &gpu.camera_bind_group,
+                                                &[],
+                                            );
+                                            let mut static_render_pass =
+                                                render_pass.forget_lifetime();
+                                            let (paint_jobs, screen_descriptor, texture_ui) =
+                                                gpu.update_ui_settings(&win, &mut encoder);
+                                            // render
+                                            gpu.ui.egui_renderer.render(
+                                                &mut static_render_pass,
+                                                &paint_jobs,
+                                                &screen_descriptor,
+                                            );
+                                            for id in texture_ui {
+                                                gpu.ui.egui_renderer.free_texture(&id);
+                                            }
+                                        }
+                                    }
+                                } // vitual scope
+                                gpu.queue.submit(std::iter::once(encoder.finish()));
+                                frame.present();
+                            }
+                        } else {
+                            println!("computer forced to run fast but the data?");
+                        }
+                    }
+                    WindowEvent::CloseRequested => {
+                        event_loop.exit();
+                        println!("Exiting application...");
+                    }
+                    _ => (),
                 }
             }
-            WindowEvent::CloseRequested => {
-                event_loop.exit();
-                println!("Exiting application...");
-            }
-            _ => (),
         }
     }
 
@@ -911,7 +1322,10 @@ impl ApplicationHandler for MyApp {
         _device_id: winit::event::DeviceId,
         event: winit::event::DeviceEvent,
     ) {
-        if self.mouse_locked {
+        if let Some(gpu) = &self.gpu_ctx {
+            if !gpu.mouse_locked {
+                return;
+            };
             if let winit::event::DeviceEvent::MouseMotion { delta } = event {
                 if let Some(gpu) = &mut self.gpu_ctx {
                     let sensitive: f32 = 0.2;
@@ -932,8 +1346,9 @@ impl ApplicationHandler for MyApp {
     }
 
     fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
+        
         if let (Some(win), Some(last_time)) = (&self.window, &self.last_time) {
-            let desire_time = Duration::from_secs_f64(1.0 / 90.0);
+            let desire_time = Duration::from_secs_f32(1.0 / self.fps);
             let time_eslaped = last_time.elapsed();
             if time_eslaped < desire_time {
                 let sleep_time = desire_time - time_eslaped;
@@ -950,8 +1365,11 @@ impl ApplicationHandler for MyApp {
                 let forward_flat = Vector3::new(forward.x, 0.0, forward.z).normalize();
                 let right = forward_flat.cross(gpu.camera.up);
                 let mut velocity = Vector3::new(0.0, 0.0, 0.0);
-                let speed = 4.0;
-                
+                let mut speed = 8.0;
+                if input.shift {
+                    speed = 12.0;
+                }
+
                 if input.w {
                     velocity += forward_flat
                 }
