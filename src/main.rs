@@ -1,3 +1,4 @@
+use bytemuck::{Pod, Zeroable};
 use cgmath::{Deg, InnerSpace, Matrix4, Point3, Quaternion, Vector3, Vector4, dot};
 use rapier3d::dynamics::RigidBodyHandle;
 use rapier3d::{
@@ -27,17 +28,54 @@ mod helper;
 const DYN: Group = Group::GROUP_1;
 const STA: Group = Group::GROUP_2;
 
+// door struct
+struct Doors {
+    offset_buffer: u32,
+    // still update SON
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct ModelMatrix {
+    matrix: [[f32; 4]; 4],
+    pad: [u32; 48],
+}
+
 #[derive(Default)]
 struct Plane {
     normal: [f32; 3],
     d: f32,
 }
 
+#[derive(Default)]
+struct PerformanceState {
+    low: bool,
+    mid: bool,
+    ok: bool,
+    high: bool,
+    very_high: bool,
+    epic: bool,
+}
+
+impl PerformanceState {
+    fn all_false(&self) -> bool {
+        ![
+            self.low,
+            self.mid,
+            self.ok,
+            self.high,
+            self.very_high,
+            self.epic,
+        ]
+        .into_iter()
+        .any(|x| x)
+    }
+}
+
 struct UI {
     egui_ctx: egui::Context,
     egui_winit_state: egui_winit::State,
     egui_renderer: egui_wgpu::Renderer,
-    should_draw: bool,
 }
 
 enum GameState {
@@ -48,12 +86,7 @@ enum GameState {
 }
 
 struct Planes {
-    left: Plane,
-    right: Plane,
-    bottom: Plane,
-    up: Plane,
-    near: Plane,
-    far: Plane,
+    planes: [Plane; 6],
 }
 
 impl Planes {
@@ -67,25 +100,19 @@ impl Planes {
             }
         };
         Self {
-            left: make_plane(m.x.w + m.x.x, m.y.w + m.y.x, m.z.w + m.z.x, m.w.w + m.w.x),
-            right: make_plane(m.x.w - m.x.x, m.y.w - m.y.x, m.z.w - m.z.x, m.w.w - m.w.x),
-            bottom: make_plane(m.x.w + m.x.y, m.y.w + m.y.y, m.z.w + m.z.y, m.w.w + m.w.y),
-            up: make_plane(m.x.w - m.x.y, m.y.w - m.y.y, m.z.w - m.z.y, m.w.w - m.w.y),
-            near: make_plane(m.x.w + m.x.z, m.y.w + m.y.z, m.z.w + m.z.z, m.w.w + m.w.z),
-            far: make_plane(m.x.w - m.x.z, m.y.w - m.y.z, m.z.w - m.z.z, m.w.w - m.w.z),
+            planes: [
+                make_plane(m.x.w + m.x.x, m.y.w + m.y.x, m.z.w + m.z.x, m.w.w + m.w.x),
+                make_plane(m.x.w - m.x.x, m.y.w - m.y.x, m.z.w - m.z.x, m.w.w - m.w.x),
+                make_plane(m.x.w + m.x.y, m.y.w + m.y.y, m.z.w + m.z.y, m.w.w + m.w.y),
+                make_plane(m.x.w - m.x.y, m.y.w - m.y.y, m.z.w - m.z.y, m.w.w - m.w.y),
+                make_plane(m.x.w + m.x.z, m.y.w + m.y.z, m.z.w + m.z.z, m.w.w + m.w.z),
+                make_plane(m.x.w - m.x.z, m.y.w - m.y.z, m.z.w - m.z.z, m.w.w - m.w.z),
+            ],
         }
     }
 
     fn frustum_culling(&self, min: [f32; 3], max: [f32; 3]) -> bool {
-        let planes = [
-            &self.left,
-            &self.right,
-            &self.bottom,
-            &self.up,
-            &self.near,
-            &self.far,
-        ];
-        for plane in planes {
+        for plane in &self.planes {
             let mut positive_normal: [f32; 3] = [0.0; 3];
             let normal = plane.normal;
             for i in 0..3 {
@@ -124,6 +151,7 @@ struct Camera {
     far: f32,
     yaw: f32,
     pitch: f32,
+    is_moving: bool,
 }
 
 impl Camera {
@@ -173,7 +201,7 @@ struct Primitive {
     center: Vector3<f32>,
     extent: Vector3<f32>,
     texture_id: usize,
-    mmbg: wgpu::BindGroup,
+    offset_buffer: u32,
 }
 
 struct Texture {
@@ -183,8 +211,9 @@ struct Texture {
 struct Meshes {
     vertex_buffer: wgpu::Buffer,
     index_buffer: wgpu::Buffer,
-    primitves: Vec<Primitive>,
+    primitives: Vec<Primitive>,
     textures: Vec<Texture>,
+    bind_group_matrices: wgpu::BindGroup,
 }
 
 struct Scene {
@@ -205,7 +234,6 @@ struct Collision {
     impulse_joint: ImpulseJointSet,
     multi_body_joint: MultibodyJointSet,
     char_controller: KinematicCharacterController,
-    v_fall: f32,
 }
 
 impl Collision {
@@ -235,21 +263,6 @@ impl Collision {
             |_| (),
         );
 
-        self.physics_pipeline.step(
-            self.gravity,
-            &self.integration,
-            &mut self.island_manager,
-            &mut self.broad_phasebvh,
-            &mut self.narrow_phase,
-            &mut self.rbs,
-            &mut self.cs,
-            &mut self.impulse_joint,
-            &mut self.multi_body_joint,
-            &mut self.ccd_solver,
-            &(),
-            &(),
-        );
-
         /*  TWO SIDES INTERACT ONLY
         self.char_controller.solve_character_collision_impulses(
             dt,
@@ -259,7 +272,7 @@ impl Collision {
         );
         */
 
-        let mut rb = &mut self.rbs[self.char_handle];
+        let rb = &mut self.rbs[self.char_handle];
         let new_pos = rb.position().translation + movement_result.translation;
         rb.set_next_kinematic_translation(new_pos);
         Point3::new(new_pos.x, new_pos.y + 2.25, new_pos.z)
@@ -283,6 +296,7 @@ struct WgpuCtx {
     game_state: GameState,
     playing: bool,
     mouse_locked: bool,
+    fps_state: PerformanceState,
 }
 
 fn make_depth_tt(device: &wgpu::Device, config: &wgpu::SurfaceConfiguration) -> wgpu::Texture {
@@ -309,6 +323,7 @@ struct MyApp {
     last_time: Option<Instant>,
     input: Option<InputState>,
     fps: f32,
+    should_draw: bool,
 }
 
 impl MyApp {
@@ -329,7 +344,7 @@ fn load_static_collider(primitive: &Primitive, rbs: &mut RigidBodySet, cs: &mut 
     let rb = RigidBodyBuilder::fixed()
         .translation(Vec3::new(center.x, center.y, center.z))
         .build();
-    let mut offset = 0.1;
+    let offset = 0.1;
 
     let collider = ColliderBuilder::cuboid(extent.x + offset, extent.y + offset, extent.z + offset)
         .collision_groups(static_group)
@@ -403,6 +418,9 @@ fn load_model(
     // tt
     let mut textures: Vec<Texture> = Vec::new();
     let mut img_cache: HashMap<usize, usize> = HashMap::new();
+    // model matrices
+    let mut matrices: Vec<ModelMatrix> = Vec::new();
+    let mut offset_buffer: u32 = 0;
     for scene in document.scenes() {
         for node in scene.nodes() {
             // matrix model
@@ -429,21 +447,6 @@ fn load_model(
                     (t * r * s).into()
                 }
             };
-
-            let model_matrix_buffer = device.create_buffer_init(&BufferInitDescriptor {
-                label: Some("model_matrix_buffer"),
-                contents: bytemuck::cast_slice(&model_matrix),
-                usage: wgpu::BufferUsages::UNIFORM,
-            });
-
-            let model_matrix_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("model matrix"),
-                layout: &model_matrix_layout,
-                entries: &[wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: model_matrix_buffer.as_entire_binding(),
-                }],
-            });
 
             if let Some(mesh) = node.mesh() {
                 for primitive in mesh.primitives() {
@@ -570,8 +573,8 @@ fn load_model(
                         .into_u32()
                         .map(|i| i + offset)
                         .collect();
-
-                    let mmbg = model_matrix_bind_group.clone();
+                    println!("len: {:?}", matrices.len());
+                    println!("{offset_buffer}");
                     pris.push(Primitive {
                         start: start,
                         count: indices.len() as u32,
@@ -580,8 +583,14 @@ fn load_model(
                         center,
                         extent,
                         texture_id,
-                        mmbg,
+                        offset_buffer,
                     });
+                    // matrices
+                    matrices.push(ModelMatrix {
+                        matrix: model_matrix,
+                        pad: [0; 48],
+                    });
+                    offset_buffer = matrices.len() as u32 * 256;
 
                     all_verticles.extend(verticle);
                     all_indices.extend(indices);
@@ -599,11 +608,32 @@ fn load_model(
         contents: bytemuck::cast_slice(&all_indices),
         usage: wgpu::BufferUsages::INDEX,
     });
+    // model matrices
+    let buffer_matrices = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("matrices buffer"),
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        size: matrices.len() as u64 * 256,
+        mapped_at_creation: false,
+    });
+    queue.write_buffer(&buffer_matrices, 0, bytemuck::cast_slice(&matrices));
+    let bind_group_matrices = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("bind_group_matrices"),
+        layout: &model_matrix_layout,
+        entries: &[wgpu::BindGroupEntry {
+            binding: 0,
+            resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                buffer: &buffer_matrices,
+                offset: 0,
+                size: std::num::NonZero::new(64),
+            }),
+        }],
+    });
     objects.push(Meshes {
         vertex_buffer,
         index_buffer,
-        primitves: pris,
+        primitives: pris,
         textures,
+        bind_group_matrices,
     });
     objects
 }
@@ -683,7 +713,7 @@ impl WgpuCtx {
                     if helper::layout_but_ui(egui, "Settings", "settings_but").clicked() {
                         self.game_state = GameState::Settings
                     };
-                    egui.add_space(50.0);
+                    egui.add_space(80.0);
                     // ext
                     if helper::layout_but_ui(egui, "Exit", "exit_but").clicked() {
                         self.game_state = GameState::Exit
@@ -725,10 +755,12 @@ impl WgpuCtx {
         std::vec::Vec<egui::ClippedPrimitive>,
         egui_wgpu::ScreenDescriptor,
         std::vec::Vec<egui::TextureId>,
+        Option<f32>,
     ) {
         let paint_jobs;
         let screen_descriptor;
         let texture_ui;
+        let mut fps: f32 = 0.0;
         {
             let ui = &mut self.ui;
             let raw_input = ui.egui_winit_state.take_egui_input(&win);
@@ -765,24 +797,83 @@ impl WgpuCtx {
                     egui.add_space(150.0);
 
                     // fov
-                    let (fov, fov_val) = helper::layout_sld_ui(egui, "Fov", &mut self.camera.fov, "fov", 30..120);
-                    if fov.changed() {
+                    let (fov, fov_val) =
+                        helper::layout_sld_ui(egui, "Fov", &mut self.camera.fov, "fov", 30..120);
+                    if fov.clicked() || fov.drag_stopped() {
                         self.camera.fov = fov_val;
+                        self.camera.is_moving = true;
                     };
                     egui.add_space(5.0);
                     // sound (deadcode)
-                    let (sound, sound_val) = helper::layout_sld_ui(egui, "Sound", &mut 50.0, "sound", 0..100);
-                    if sound.changed() {
+                    let (sound, sound_val) =
+                        helper::layout_sld_ui(egui, "Sound", &mut 50.0, "sound", 0..100);
+                    if sound.clicked() || sound.drag_stopped() {
                         println!("Sound changed to: {sound_val}");
                     };
                     egui.add_space(20.0);
                     // fps editor
                     egui.horizontal(|ui| {
-                        ui.label(egui::RichText::new("FPS")
-                            .color(egui::Color32::WHITE)
-                            .font(egui::FontId::monospace(20.0))
+                        ui.label(
+                            egui::RichText::new("FPS")
+                                .color(egui::Color32::WHITE)
+                                .font(egui::FontId::monospace(30.0)),
                         );
-                        
+                        ui.add_space(80.0);
+                        if helper::layout_chb_ui(ui, "30", "30_chb", &self.fps_state.low).clicked()
+                        {
+                            self.fps_state = PerformanceState {
+                                low: !self.fps_state.low,
+                                ..Default::default()
+                            };
+                            fps = 30.0;
+                        };
+                        if helper::layout_chb_ui(ui, "60", "60_chb", &self.fps_state.mid).clicked()
+                        {
+                            self.fps_state = PerformanceState {
+                                mid: !self.fps_state.mid,
+                                ..Default::default()
+                            };
+                            fps = 60.0;
+                        };
+                        if helper::layout_chb_ui(ui, "90", "90_chb", &self.fps_state.ok).clicked() {
+                            self.fps_state = PerformanceState {
+                                ok: !self.fps_state.ok,
+                                ..Default::default()
+                            };
+                            fps = 90.0;
+                        };
+                        if helper::layout_chb_ui(ui, "120", "120_chb", &self.fps_state.high)
+                            .clicked()
+                        {
+                            self.fps_state = PerformanceState {
+                                high: !self.fps_state.high,
+                                ..Default::default()
+                            };
+                            fps = 120.0;
+                        };
+                        if helper::layout_chb_ui(ui, "144", "144_chb", &self.fps_state.very_high)
+                            .clicked()
+                        {
+                            self.fps_state = PerformanceState {
+                                very_high: !self.fps_state.very_high,
+                                ..Default::default()
+                            };
+                            fps = 144.0;
+                        };
+                        if helper::layout_chb_ui(ui, "240", "240_chb", &self.fps_state.epic)
+                            .clicked()
+                        {
+                            self.fps_state = PerformanceState {
+                                epic: !self.fps_state.epic,
+                                ..Default::default()
+                            };
+                            fps = 240.0;
+                        };
+                        if self.fps_state.all_false() {
+                            if helper::layout_chb_ui(ui, "???", "???", &true).clicked() {
+                                ()
+                            };
+                        };
                     });
                     egui.add_space(40.0);
                     // ext
@@ -815,7 +906,7 @@ impl WgpuCtx {
                 &screen_descriptor,
             );
         }
-        (paint_jobs, screen_descriptor, texture_ui)
+        (paint_jobs, screen_descriptor, texture_ui, Some(fps))
     }
 }
 
@@ -897,6 +988,21 @@ impl ApplicationHandler for MyApp {
                     }],
                 });
 
+            let model_bind_group_layout =
+                device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("model_matrices_bind_group_layout"),
+                    entries: &[wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::VERTEX,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: true,
+                            min_binding_size: std::num::NonZero::new(64),
+                        },
+                        count: None,
+                    }],
+                });
+
             let mut meshes: Vec<Meshes> = Vec::new();
 
             let paths = ["./src/_.glb"];
@@ -907,10 +1013,10 @@ impl ApplicationHandler for MyApp {
                     &device,
                     &queue,
                     &texture_layout,
-                    &camera_bind_group_layout,
+                    &model_bind_group_layout,
                 ));
             }
-            let scene = Scene {meshes};
+            let scene = Scene { meshes };
             // end for return vec
 
             // load static collision
@@ -918,21 +1024,16 @@ impl ApplicationHandler for MyApp {
             let mut cs = ColliderSet::new();
             let gravity = Vec3::new(0.0, 0.0, 0.0);
             let integration = IntegrationParameters::default();
-            let mut physics_pipeline = PhysicsPipeline::new();
-            let mut island_manager = IslandManager::new();
-            let mut broad_phasebvh = BroadPhaseBvh::new();
-            let mut narrow_phase = NarrowPhase::new();
-            let mut ccd_solver = CCDSolver::new();
-            let mut impulse_joint = ImpulseJointSet::new();
-            let mut multi_body_joint = MultibodyJointSet::new();
-            let mut query_pipeline_mut = broad_phasebvh.as_query_pipeline_mut(
-                narrow_phase.query_dispatcher(),
-                &mut rbs,
-                &mut cs,
-                QueryFilter::default(),
-            );
+            let physics_pipeline = PhysicsPipeline::new();
+            let island_manager = IslandManager::new();
+            let broad_phasebvh = BroadPhaseBvh::new();
+            let narrow_phase = NarrowPhase::new();
+            let ccd_solver = CCDSolver::new();
+            let impulse_joint = ImpulseJointSet::new();
+            let multi_body_joint = MultibodyJointSet::new();
+
             for mesh in &scene.meshes {
-                for primitive in &mesh.primitves {
+                for primitive in &mesh.primitives {
                     load_static_collider(&primitive, &mut rbs, &mut cs);
                 }
             }
@@ -961,7 +1062,6 @@ impl ApplicationHandler for MyApp {
                 egui_ctx,
                 egui_winit_state,
                 egui_renderer,
-                should_draw: false,
             };
 
             let camera = Camera {
@@ -974,6 +1074,7 @@ impl ApplicationHandler for MyApp {
                 far: 75.0,
                 yaw: -90.0,
                 pitch: 0.0,
+                is_moving: true,
             };
 
             let (char_handle, char_controller) =
@@ -993,7 +1094,6 @@ impl ApplicationHandler for MyApp {
                 impulse_joint,
                 multi_body_joint,
                 char_controller,
-                v_fall: 0.0,
             };
 
             let camera_uniform = UniformCamera {
@@ -1015,7 +1115,7 @@ impl ApplicationHandler for MyApp {
                 bind_group_layouts: &[
                     Some(&camera_bind_group_layout),
                     Some(&texture_layout),
-                    Some(&camera_bind_group_layout),
+                    Some(&model_bind_group_layout),
                 ],
                 ..Default::default()
             });
@@ -1077,6 +1177,10 @@ impl ApplicationHandler for MyApp {
             let depth_view = depth_texture.create_view(&wgpu::TextureViewDescriptor::default());
 
             let game_state = GameState::Menu;
+            let fps_state = PerformanceState {
+                mid: true,
+                ..Default::default()
+            };
 
             WgpuCtx {
                 surface,
@@ -1095,6 +1199,7 @@ impl ApplicationHandler for MyApp {
                 game_state,
                 playing: false,
                 mouse_locked: false,
+                fps_state,
             }
         });
 
@@ -1103,17 +1208,25 @@ impl ApplicationHandler for MyApp {
         self.gpu_ctx = Some(gpu_ctx);
         self.last_time = Some(Instant::now());
         self.fps = 60.0;
+        self.should_draw = true;
     }
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _: WindowId, event: WindowEvent) {
         if let Some(gpu) = &mut self.gpu_ctx {
             let state = &mut gpu.ui.egui_winit_state;
             let res = state.on_window_event(&self.window.as_deref().unwrap(), &event);
             let consumed = match gpu.game_state {
-                GameState::Play => {gpu.ui.should_draw = true; false},
-                _ => {res.consumed},
+                GameState::Play => {
+                    self.should_draw = true;
+                    false
+                }
+                _ => res.consumed,
             };
             if consumed {
-                if res.repaint { gpu.ui.should_draw = true; } else {gpu.ui.should_draw = false};
+                if res.repaint {
+                    self.should_draw = true;
+                } else {
+                    self.should_draw = false
+                };
                 return;
             } else {
                 match event {
@@ -1178,7 +1291,7 @@ impl ApplicationHandler for MyApp {
                     }
 
                     WindowEvent::RedrawRequested => {
-                        if let (Some(win), Some(gpu)) = (&self.window, &mut self.gpu_ctx) {
+                        if let (Some(win), Some(gpu)) = (&mut self.window, &mut self.gpu_ctx) {
                             if let Some((frame, view)) = gpu.get_frame_view() {
                                 let mut encoder = gpu.device.create_command_encoder(
                                     &wgpu::CommandEncoderDescriptor {
@@ -1210,7 +1323,7 @@ impl ApplicationHandler for MyApp {
                                                     mesh.index_buffer.slice(..),
                                                     wgpu::IndexFormat::Uint32,
                                                 );
-                                                let primitives = &mesh.primitves;
+                                                let primitives = &mesh.primitives;
                                                 for primitive in primitives {
                                                     if gpu.camera_planes.frustum_culling(
                                                         primitive.min,
@@ -1224,8 +1337,8 @@ impl ApplicationHandler for MyApp {
                                                         );
                                                         render_pass.set_bind_group(
                                                             2,
-                                                            &primitive.mmbg,
-                                                            &[],
+                                                            &mesh.bind_group_matrices,
+                                                            &[primitive.offset_buffer],
                                                         );
                                                         render_pass.draw_indexed(
                                                             primitive.start
@@ -1285,8 +1398,16 @@ impl ApplicationHandler for MyApp {
                                             );
                                             let mut static_render_pass =
                                                 render_pass.forget_lifetime();
-                                            let (paint_jobs, screen_descriptor, texture_ui) =
+                                            let (paint_jobs, screen_descriptor, texture_ui, fps) =
                                                 gpu.update_ui_settings(&win, &mut encoder);
+                                            match fps {
+                                                Some(fps) => {
+                                                    if fps != 0.0 {
+                                                        self.fps = fps;
+                                                    }
+                                                }
+                                                None => (),
+                                            }
                                             // render
                                             gpu.ui.egui_renderer.render(
                                                 &mut static_render_pass,
@@ -1339,14 +1460,16 @@ impl ApplicationHandler for MyApp {
                         gpu.camera.pitch = -89.0
                     }
 
-                    gpu.camera.update_target();
+                    gpu.camera.is_moving = true;
                 }
             }
         }
     }
 
     fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
-        
+        if !self.should_draw {
+            return;
+        };
         if let (Some(win), Some(last_time)) = (&self.window, &self.last_time) {
             let desire_time = Duration::from_secs_f32(1.0 / self.fps);
             let time_eslaped = last_time.elapsed();
@@ -1371,32 +1494,61 @@ impl ApplicationHandler for MyApp {
                 }
 
                 if input.w {
-                    velocity += forward_flat
+                    velocity += forward_flat;
+                    gpu.camera.is_moving = true;
                 }
                 if input.s {
-                    velocity -= forward_flat
+                    velocity -= forward_flat;
+                    gpu.camera.is_moving = true;
                 }
                 if input.a {
-                    velocity -= right
+                    velocity -= right;
+                    gpu.camera.is_moving = true;
                 }
                 if input.d {
-                    velocity += right
+                    velocity += right;
+                    gpu.camera.is_moving = true;
                 }
                 if input.q {
-                    velocity.y -= 1.0
+                    velocity.y -= 1.0;
+                    gpu.camera.is_moving = true;
                 }
                 if input.e {
-                    velocity.y += 1.0
+                    velocity.y += 1.0;
+                    gpu.camera.is_moving = true;
                 }
 
-                let new_pos = collision.update_check_collision(dt, &velocity.normalize(), speed);
-                gpu.camera.eye = new_pos;
-                gpu.camera.update_target();
-                gpu.camera_planes = Planes::build_plane_from_matrix4(gpu.camera.make_camera());
+                collision.physics_pipeline.step(
+                    collision.gravity,
+                    &collision.integration,
+                    &mut collision.island_manager,
+                    &mut collision.broad_phasebvh,
+                    &mut collision.narrow_phase,
+                    &mut collision.rbs,
+                    &mut collision.cs,
+                    &mut collision.impulse_joint,
+                    &mut collision.multi_body_joint,
+                    &mut collision.ccd_solver,
+                    &(),
+                    &(),
+                );
 
-                let new_matrix: [[f32; 4]; 4] = gpu.camera.make_camera().into();
-                gpu.queue
-                    .write_buffer(&gpu.camera_buffer, 0, bytemuck::cast_slice(&new_matrix));
+                if gpu.camera.is_moving {
+                    let new_pos =
+                        collision.update_check_collision(dt, &velocity.normalize(), speed);
+                    gpu.camera.eye = new_pos;
+
+                    gpu.camera.update_target();
+                    gpu.camera_planes = Planes::build_plane_from_matrix4(gpu.camera.make_camera());
+
+                    let new_matrix: [[f32; 4]; 4] = gpu.camera.make_camera().into();
+                    gpu.queue.write_buffer(
+                        &gpu.camera_buffer,
+                        0,
+                        bytemuck::cast_slice(&new_matrix),
+                    );
+                    gpu.camera.is_moving = false;
+                };
             }
         };
     }

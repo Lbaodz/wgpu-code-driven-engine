@@ -8,7 +8,9 @@ This game was made by **Lbaodz**
 * Install rustup to your device. Link guide: [CLICK HERE](https://rust-lang.org/tools/install/)
 * Install Cargo. [CLICK HERE](https://doc.rust-lang.org/cargo/getting-started/installation.html)
 * Then, download this repository.
-* After finishing, open your terminal at the project folder and run: `cargo run`
+* After finishing, open your terminal at the project folder and run: `cargo run --release`
+
+## OR Download binary file version (coming soon)
 
 <!--May Insert ONE video here..-->
 
