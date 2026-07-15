@@ -1,6 +1,6 @@
 use bytemuck::{Pod, Zeroable};
 use cgmath::{Deg, InnerSpace, Matrix4, Point3, Quaternion, Vector3, Vector4, dot};
-use rapier3d::dynamics::RigidBodyHandle;
+use rapier3d::dynamics::{RevoluteJointBuilder, RigidBodyHandle};
 use rapier3d::{
     control::{CharacterAutostep, CharacterLength, KinematicCharacterController},
     dynamics::{
@@ -17,6 +17,7 @@ use rapier3d::{
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use std::vec;
 use wgpu::util::{BufferInitDescriptor, DeviceExt};
 use winit::application::ApplicationHandler;
 use winit::event::{KeyEvent, WindowEvent};
@@ -27,11 +28,18 @@ mod helper;
 
 const DYN: Group = Group::GROUP_1;
 const STA: Group = Group::GROUP_2;
+const DOR: Group = Group::GROUP_3;
 
 // door struct
-struct Doors {
-    offset_buffer: u32,
-    // still update SON
+struct Door {
+    lock_pos: Vec3,
+    lock_for_door: Vec3,
+    scale: Vector3<f32>,
+}
+
+struct IsDoor {
+    id: Option<u32>,
+    door: bool,
 }
 
 #[repr(C)]
@@ -152,6 +160,7 @@ struct Camera {
     yaw: f32,
     pitch: f32,
     is_moving: bool,
+    is_rotating: bool,
 }
 
 impl Camera {
@@ -192,7 +201,7 @@ struct Vertex {
     normal: [f32; 3],
     uv: [f32; 2],
 }
-#[derive(Debug)]
+
 struct Primitive {
     start: u32,
     count: u32,
@@ -202,6 +211,7 @@ struct Primitive {
     extent: Vector3<f32>,
     texture_id: usize,
     offset_buffer: u32,
+    is_door: IsDoor,
 }
 
 struct Texture {
@@ -214,6 +224,8 @@ struct Meshes {
     primitives: Vec<Primitive>,
     textures: Vec<Texture>,
     bind_group_matrices: wgpu::BindGroup,
+    buffer_matrices: wgpu::Buffer,
+    doors: Vec<Door>,
 }
 
 struct Scene {
@@ -234,6 +246,7 @@ struct Collision {
     impulse_joint: ImpulseJointSet,
     multi_body_joint: MultibodyJointSet,
     char_controller: KinematicCharacterController,
+    doors_handle: Vec<RigidBodyHandle>,
 }
 
 impl Collision {
@@ -245,8 +258,10 @@ impl Collision {
     ) -> Point3<f32> {
         let char_data = &self.rbs[self.char_handle];
         let char_collider_handle = char_data.colliders()[0];
-        let (character_shape, character_pos) =
-            (&self.cs[char_collider_handle].shape(), char_data.position());
+        let (character_shape, character_pos) = (
+            self.cs[char_collider_handle].shared_shape().clone(),
+            char_data.position(),
+        );
         let query_pipeline = self.broad_phasebvh.as_query_pipeline(
             self.narrow_phase.query_dispatcher(),
             &self.rbs,
@@ -254,28 +269,60 @@ impl Collision {
             QueryFilter::default().exclude_collider(char_collider_handle),
         );
 
+        let mut collisions = Vec::new();
         let movement_result = self.char_controller.move_shape(
             dt,
             &query_pipeline,
-            *character_shape,
+            character_shape.as_ref(),
             character_pos,
             Vec3::new(desire_movement.x, desire_movement.y, desire_movement.z) * speed * dt,
-            |_| (),
+            |collision| collisions.push(collision),
         );
 
-        /*  TWO SIDES INTERACT ONLY
+        let mut query_pipeline_mut = self.broad_phasebvh.as_query_pipeline_mut(
+            self.narrow_phase.query_dispatcher(),
+            &mut self.rbs,
+            &mut self.cs,
+            QueryFilter::default().exclude_collider(char_collider_handle),
+        );
+
+        let mass = 50.0;
         self.char_controller.solve_character_collision_impulses(
             dt,
             &mut query_pipeline_mut,
-            *character_shape, 4.0,
-            movement_result.collision,
+            character_shape.as_ref(),
+            mass,
+            &collisions,
         );
-        */
 
         let rb = &mut self.rbs[self.char_handle];
         let new_pos = rb.position().translation + movement_result.translation;
         rb.set_next_kinematic_translation(new_pos);
         Point3::new(new_pos.x, new_pos.y + 2.25, new_pos.z)
+    }
+
+    fn check_door(
+        &self,
+        doors: &Vec<Door>,
+        primitive: &Primitive,
+    ) -> Vec<(Option<Matrix4<f32>>, Option<u32>)> {
+        let index = doors.len();
+        (0..index)
+            .map(|i| {
+                let door_pos = self.rbs[self.doors_handle[i]].position();
+                let translation = door_pos.translation;
+                let rot = door_pos.rotation;
+                let sca = doors[i].scale;
+                let t = Matrix4::from_translation(Vector3::new(
+                    translation.x,
+                    translation.y,
+                    translation.z,
+                ));
+                let r = Matrix4::from(Quaternion::new(rot.x, rot.y, rot.z, rot.w));
+                let s = Matrix4::from_nonuniform_scale(sca.x, sca.y, sca.z);
+                (Some(t * r * s), Some(primitive.offset_buffer))
+            })
+            .collect::<Vec<(Option<Matrix4<f32>>, Option<u32>)>>()
     }
 }
 
@@ -297,6 +344,7 @@ struct WgpuCtx {
     playing: bool,
     mouse_locked: bool,
     fps_state: PerformanceState,
+    audio: helper::Audio,
 }
 
 fn make_depth_tt(device: &wgpu::Device, config: &wgpu::SurfaceConfiguration) -> wgpu::Texture {
@@ -321,7 +369,7 @@ struct MyApp {
     window: Option<Arc<Window>>,
     gpu_ctx: Option<WgpuCtx>,
     last_time: Option<Instant>,
-    input: Option<InputState>,
+    input: InputState,
     fps: f32,
     should_draw: bool,
 }
@@ -335,22 +383,93 @@ impl MyApp {
                 .expect("window create failed!"),
         )
     }
+
+    fn update_last_time(&mut self) -> f32 {
+        if let (Some(win), Some(last_time)) = (&self.window, &self.last_time) {
+            let desire_time = Duration::from_secs_f32(1.0 / self.fps);
+            let time_eslaped = last_time.elapsed();
+            if time_eslaped < desire_time {
+                let sleep_time = desire_time - time_eslaped;
+                std::thread::sleep(sleep_time);
+            };
+            let now = Instant::now();
+            let dt = now.duration_since(*last_time).as_secs_f32();
+            self.last_time = Some(now);
+            win.request_redraw();
+            dt
+        } else {
+            panic!("no win object")
+        }
+    }
 }
 
-fn load_static_collider(primitive: &Primitive, rbs: &mut RigidBodySet, cs: &mut ColliderSet) {
-    let static_group = InteractionGroups::new(STA, DYN, InteractionTestMode::Or);
+fn load_door_collider(
+    primitive: &Primitive,
+    rbs: &mut RigidBodySet,
+    cs: &mut ColliderSet,
+    doors: &Vec<Door>,
+    id: usize,
+    joints: &mut ImpulseJointSet,
+) -> RigidBodyHandle {
+    let door_group = InteractionGroups::new(DOR, DYN, InteractionTestMode::Or);
     let extent = primitive.extent;
     let center = primitive.center;
-    let rb = RigidBodyBuilder::fixed()
+    let door = RigidBodyBuilder::dynamic()
         .translation(Vec3::new(center.x, center.y, center.z))
         .build();
+    let door_handle = rbs.insert(door);
     let offset = 0.1;
 
     let collider = ColliderBuilder::cuboid(extent.x + offset, extent.y + offset, extent.z + offset)
-        .collision_groups(static_group)
+        .collision_groups(door_group)
         .build();
-    let rb_handle = rbs.insert(rb);
-    cs.insert_with_parent(collider, rb_handle, rbs);
+    cs.insert_with_parent(collider, door_handle, rbs);
+
+    let lp = doors[id].lock_pos;
+    let lock = RigidBodyBuilder::fixed().translation(lp).build();
+    let lock_handle = rbs.insert(lock);
+
+    let joint = RevoluteJointBuilder::new(Vec3::new(0.0, 1.0, 0.0))
+        .local_anchor1(lp)
+        .local_anchor2(doors[id].lock_for_door)
+        .limits([0.0, std::f32::consts::FRAC_PI_2]);
+
+    joints.insert(lock_handle, door_handle, joint, true);
+    door_handle
+}
+
+fn load_static_collider(
+    primitive: &Primitive,
+    rbs: &mut RigidBodySet,
+    cs: &mut ColliderSet,
+    doors: &Vec<Door>,
+    joints: &mut ImpulseJointSet,
+) -> Option<RigidBodyHandle> {
+    if primitive.is_door.door && !(doors.len() == 0) {
+        if let Some(i) = primitive.is_door.id {
+            let id = i as usize;
+            return Some(load_door_collider(primitive, rbs, cs, doors, id, joints));
+        } else {
+            None
+        }
+    } else {
+        let static_group = InteractionGroups::new(STA, DYN, InteractionTestMode::Or);
+        let extent = primitive.extent;
+        let center = primitive.center;
+        let rb = RigidBodyBuilder::fixed()
+            .translation(Vec3::new(center.x, center.y, center.z))
+            .build();
+        let offset = 0.1;
+
+        let collider =
+            ColliderBuilder::cuboid(extent.x + offset, extent.y + offset, extent.z + offset)
+                .collision_groups(static_group)
+                .build();
+        let rb_handle = rbs.insert(rb);
+        cs.insert_with_parent(collider, rb_handle, rbs);
+
+        None
+    }
 }
 
 fn load_player_collision(
@@ -421,9 +540,16 @@ fn load_model(
     // model matrices
     let mut matrices: Vec<ModelMatrix> = Vec::new();
     let mut offset_buffer: u32 = 0;
+    // door check
+    let mut door_pos: Vec<Vec3> = Vec::new();
+    let mut lock_pos: Vec<Vec3> = Vec::new();
+    let mut id: u32 = 0;
+    let mut scales: Vec<Vector3<f32>> = Vec::new();
+
     for scene in document.scenes() {
         for node in scene.nodes() {
             // matrix model
+            let mut door = false;
             let model_matrix: [[f32; 4]; 4] = match node.transform() {
                 gltf::scene::Transform::Matrix { matrix } => matrix,
                 gltf::scene::Transform::Decomposed {
@@ -431,6 +557,29 @@ fn load_model(
                     rotation,
                     scale,
                 } => {
+                    match node.name() {
+                        Some("door") => {
+                            door = true;
+                            door_pos.push(Vec3::new(
+                                translation[0],
+                                translation[1],
+                                translation[2],
+                            ));
+                            scales.push(Vector3::new(scale[0], scale[1], scale[2]));
+                            if !(id == 0) {
+                                id += 1;
+                            };
+                        }
+                        Some("empty") => {
+                            lock_pos.push(Vec3::new(
+                                translation[0],
+                                translation[1],
+                                translation[2],
+                            ));
+                        }
+                        None => (),
+                        _ => (),
+                    };
                     let t: Matrix4<f32> = Matrix4::from_translation(Vector3::new(
                         translation[0],
                         translation[1],
@@ -575,6 +724,10 @@ fn load_model(
                         .collect();
                     println!("len: {:?}", matrices.len());
                     println!("{offset_buffer}");
+
+                    let id = if door { Some(id) } else { None };
+                    let is_door = IsDoor { id, door };
+
                     pris.push(Primitive {
                         start: start,
                         count: indices.len() as u32,
@@ -584,6 +737,7 @@ fn load_model(
                         extent,
                         texture_id,
                         offset_buffer,
+                        is_door,
                     });
                     // matrices
                     matrices.push(ModelMatrix {
@@ -628,13 +782,35 @@ fn load_model(
             }),
         }],
     });
+
+    let mut doors: Vec<Door> = Vec::new();
+    println!("{:?}, ANDANDAND {:?}", lock_pos, door_pos);
+    if (lock_pos.len() == 0) || (door_pos.len() == 0) {
+        ()
+    } else {
+        doors = (0..id)
+            .map(|index| {
+                let i = index as usize;
+                let d = lock_pos[i] - door_pos[i];
+                Door {
+                    lock_pos: lock_pos[i],
+                    lock_for_door: Vec3::new(d.x, d.y, d.z),
+                    scale: scales[i],
+                }
+            })
+            .collect();
+    }
+
     objects.push(Meshes {
         vertex_buffer,
         index_buffer,
         primitives: pris,
         textures,
         bind_group_matrices,
+        buffer_matrices,
+        doors,
     });
+
     objects
 }
 
@@ -692,6 +868,7 @@ impl WgpuCtx {
                 )
                 .anchor(egui::Align2::CENTER_CENTER, egui::vec2(-500.0, -300.0))
                 .show(&ui.egui_ctx, |egui| {
+                    egui.style_mut().interaction.selectable_labels = false;
                     egui.add_space(50.0);
                     egui.label(
                         egui::RichText::new("NoGAmE")
@@ -787,6 +964,7 @@ impl WgpuCtx {
                 )
                 .anchor(egui::Align2::CENTER_CENTER, egui::vec2(-410.0, -300.0))
                 .show(&ui.egui_ctx, |egui| {
+                    egui.style_mut().interaction.selectable_labels = false;
                     egui.add_space(50.0);
                     egui.label(
                         egui::RichText::new("Settings")
@@ -805,10 +983,15 @@ impl WgpuCtx {
                     };
                     egui.add_space(5.0);
                     // sound (deadcode)
-                    let (sound, sound_val) =
-                        helper::layout_sld_ui(egui, "Sound", &mut 50.0, "sound", 0..100);
+                    let (sound, sound_val) = helper::layout_sld_ui(
+                        egui,
+                        "Sound",
+                        &mut self.audio.volume,
+                        "sound",
+                        0..100,
+                    );
                     if sound.clicked() || sound.drag_stopped() {
-                        println!("Sound changed to: {sound_val}");
+                        self.audio.volume = sound_val;
                     };
                     egui.add_space(20.0);
                     // fps editor
@@ -1005,7 +1188,7 @@ impl ApplicationHandler for MyApp {
 
             let mut meshes: Vec<Meshes> = Vec::new();
 
-            let paths = ["./src/_.glb"];
+            let paths = ["./src/door.glb", "./src/ok.glb", "./src/_.glb", "./src/_1.glb"];
             // for path in paths later.. and meshes[i] *for each* file gltf loaded
             for path in paths {
                 meshes.extend(load_model(
@@ -1029,12 +1212,23 @@ impl ApplicationHandler for MyApp {
             let broad_phasebvh = BroadPhaseBvh::new();
             let narrow_phase = NarrowPhase::new();
             let ccd_solver = CCDSolver::new();
-            let impulse_joint = ImpulseJointSet::new();
+            let mut impulse_joint = ImpulseJointSet::new();
             let multi_body_joint = MultibodyJointSet::new();
+
+            let mut doors_handle: Vec<RigidBodyHandle> = Vec::new();
 
             for mesh in &scene.meshes {
                 for primitive in &mesh.primitives {
-                    load_static_collider(&primitive, &mut rbs, &mut cs);
+                    match load_static_collider(
+                        &primitive,
+                        &mut rbs,
+                        &mut cs,
+                        &mesh.doors,
+                        &mut impulse_joint,
+                    ) {
+                        Some(door_handle) => doors_handle.push(door_handle),
+                        _ => (),
+                    };
                 }
             }
 
@@ -1075,6 +1269,7 @@ impl ApplicationHandler for MyApp {
                 yaw: -90.0,
                 pitch: 0.0,
                 is_moving: true,
+                is_rotating: true,
             };
 
             let (char_handle, char_controller) =
@@ -1094,6 +1289,7 @@ impl ApplicationHandler for MyApp {
                 impulse_joint,
                 multi_body_joint,
                 char_controller,
+                doors_handle,
             };
 
             let camera_uniform = UniformCamera {
@@ -1181,6 +1377,9 @@ impl ApplicationHandler for MyApp {
                 mid: true,
                 ..Default::default()
             };
+            let mut audio = helper::Audio::new();
+            audio.load("jog", "./src/audio/jog.mp3");
+            audio.load("boom", "./src/audio/boom.mp3");
 
             WgpuCtx {
                 surface,
@@ -1200,10 +1399,11 @@ impl ApplicationHandler for MyApp {
                 playing: false,
                 mouse_locked: false,
                 fps_state,
+                audio,
             }
         });
 
-        self.input = Some(InputState::default());
+        self.input = InputState::default();
         self.window = Some(window);
         self.gpu_ctx = Some(gpu_ctx);
         self.last_time = Some(Instant::now());
@@ -1219,14 +1419,14 @@ impl ApplicationHandler for MyApp {
                     self.should_draw = true;
                     false
                 }
-                _ => res.consumed,
+                _ => {
+                    if !gpu.audio.is_playing("boom") {
+                        gpu.audio.play_again("boom", "boom", 1.0, 1.0);
+                    }
+                    res.consumed
+                }
             };
             if consumed {
-                if res.repaint {
-                    self.should_draw = true;
-                } else {
-                    self.should_draw = false
-                };
                 return;
             } else {
                 match event {
@@ -1246,6 +1446,7 @@ impl ApplicationHandler for MyApp {
                                 gpu.mouse_locked = false;
                                 gpu.game_state = GameState::Menu;
                                 gpu.playing = false;
+                                self.input = InputState::default();
                                 println!("unlock");
                             }
                         }
@@ -1272,7 +1473,7 @@ impl ApplicationHandler for MyApp {
                         ..
                     } => {
                         let is_pressed = state.is_pressed();
-                        if let Some(input) = &mut self.input
+                        if let input = &mut self.input
                             && gpu.playing
                         {
                             match key {
@@ -1288,6 +1489,14 @@ impl ApplicationHandler for MyApp {
                                 _ => (),
                             }
                         }
+                    }
+
+                    WindowEvent::MouseInput {
+                        state: winit::event::ElementState::Pressed,
+                        button: winit::event::MouseButton::Left,
+                        ..
+                    } => {
+                        self.should_draw = true;
                     }
 
                     WindowEvent::RedrawRequested => {
@@ -1445,6 +1654,7 @@ impl ApplicationHandler for MyApp {
     ) {
         if let Some(gpu) = &self.gpu_ctx {
             if !gpu.mouse_locked {
+                self.should_draw = true;
                 return;
             };
             if let winit::event::DeviceEvent::MouseMotion { delta } = event {
@@ -1460,95 +1670,120 @@ impl ApplicationHandler for MyApp {
                         gpu.camera.pitch = -89.0
                     }
 
-                    gpu.camera.is_moving = true;
+                    gpu.camera.is_rotating = true;
                 }
             }
         }
     }
 
     fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
-        if !self.should_draw {
-            return;
-        };
-        if let (Some(win), Some(last_time)) = (&self.window, &self.last_time) {
-            let desire_time = Duration::from_secs_f32(1.0 / self.fps);
-            let time_eslaped = last_time.elapsed();
-            if time_eslaped < desire_time {
-                let sleep_time = desire_time - time_eslaped;
-                std::thread::sleep(sleep_time);
-            };
-            let now = Instant::now();
-            let dt = now.duration_since(*last_time).as_secs_f32();
-            self.last_time = Some(now);
-            win.request_redraw();
+        let dt = self.update_last_time();
+        if let Some(gpu) =
+            &mut self.gpu_ctx
+        {
+            match gpu.game_state {
+                GameState::Play => {
+                    let input = &self.input;
+                    let collision = &mut gpu.collision;
+                    let forward = gpu.camera.update_target();
+                    let forward_flat = Vector3::new(forward.x, 0.0, forward.z).normalize();
+                    let right = forward_flat.cross(gpu.camera.up);
+                    let mut velocity = Vector3::new(0.0, 0.0, 0.0);
+                    let mut speed = 8.0;
+                    if input.shift {
+                        speed = 12.0;
+                    }
 
-            if let (Some(gpu), Some(input)) = (&mut self.gpu_ctx, &self.input) {
-                let collision = &mut gpu.collision;
-                let forward = gpu.camera.update_target();
-                let forward_flat = Vector3::new(forward.x, 0.0, forward.z).normalize();
-                let right = forward_flat.cross(gpu.camera.up);
-                let mut velocity = Vector3::new(0.0, 0.0, 0.0);
-                let mut speed = 8.0;
-                if input.shift {
-                    speed = 12.0;
-                }
+                    if input.w {
+                        velocity += forward_flat;
+                        gpu.camera.is_moving = true;
+                    }
+                    if input.s {
+                        velocity -= forward_flat;
+                        gpu.camera.is_moving = true;
+                    }
+                    if input.a {
+                        velocity -= right;
+                        gpu.camera.is_moving = true;
+                    }
+                    if input.d {
+                        velocity += right;
+                        gpu.camera.is_moving = true;
+                    }
+                    if input.q {
+                        velocity.y -= 1.0;
+                        gpu.camera.is_moving = true;
+                    }
+                    if input.e {
+                        velocity.y += 1.0;
+                        gpu.camera.is_moving = true;
+                    }
 
-                if input.w {
-                    velocity += forward_flat;
-                    gpu.camera.is_moving = true;
-                }
-                if input.s {
-                    velocity -= forward_flat;
-                    gpu.camera.is_moving = true;
-                }
-                if input.a {
-                    velocity -= right;
-                    gpu.camera.is_moving = true;
-                }
-                if input.d {
-                    velocity += right;
-                    gpu.camera.is_moving = true;
-                }
-                if input.q {
-                    velocity.y -= 1.0;
-                    gpu.camera.is_moving = true;
-                }
-                if input.e {
-                    velocity.y += 1.0;
-                    gpu.camera.is_moving = true;
-                }
-
-                collision.physics_pipeline.step(
-                    collision.gravity,
-                    &collision.integration,
-                    &mut collision.island_manager,
-                    &mut collision.broad_phasebvh,
-                    &mut collision.narrow_phase,
-                    &mut collision.rbs,
-                    &mut collision.cs,
-                    &mut collision.impulse_joint,
-                    &mut collision.multi_body_joint,
-                    &mut collision.ccd_solver,
-                    &(),
-                    &(),
-                );
-
-                if gpu.camera.is_moving {
-                    let new_pos =
-                        collision.update_check_collision(dt, &velocity.normalize(), speed);
-                    gpu.camera.eye = new_pos;
-
-                    gpu.camera.update_target();
-                    gpu.camera_planes = Planes::build_plane_from_matrix4(gpu.camera.make_camera());
-
-                    let new_matrix: [[f32; 4]; 4] = gpu.camera.make_camera().into();
-                    gpu.queue.write_buffer(
-                        &gpu.camera_buffer,
-                        0,
-                        bytemuck::cast_slice(&new_matrix),
+                    collision.physics_pipeline.step(
+                        collision.gravity,
+                        &collision.integration,
+                        &mut collision.island_manager,
+                        &mut collision.broad_phasebvh,
+                        &mut collision.narrow_phase,
+                        &mut collision.rbs,
+                        &mut collision.cs,
+                        &mut collision.impulse_joint,
+                        &mut collision.multi_body_joint,
+                        &mut collision.ccd_solver,
+                        &(),
+                        &(),
                     );
-                    gpu.camera.is_moving = false;
-                };
+                            helper::ram();
+                    if gpu.camera.is_moving || gpu.camera.is_rotating {
+                        if !gpu.audio.is_playing("jog") && gpu.camera.is_moving {
+                            gpu.audio.play_again("jog", "jog", 1.0, 2.0);
+                            helper::ram();
+                        } else if !gpu.camera.is_moving {
+                            gpu.audio.stop_slowly("jog", 10.0, dt)
+                        }
+
+                        for mesh in &gpu.scene.meshes {
+                            for primitive in &mesh.primitives {
+                                if primitive.is_door.door {
+                                    let data: Vec<(Option<Matrix4<f32>>, Option<u32>)> =
+                                        collision.check_door(&mesh.doors, &primitive);
+                                    let data_unwrap: Vec<(Matrix4<f32>, u32)> =
+                                        data.into_iter().filter_map(|(m, o)| m.zip(o)).collect();
+                                    for (matrix, offset_buffer) in data_unwrap {
+                                        let m: [[f32; 4]; 4] = matrix.into();
+                                        gpu.queue.write_buffer(
+                                            &mesh.buffer_matrices,
+                                            offset_buffer as u64,
+                                            bytemuck::cast_slice(&m),
+                                        );
+                                    }
+                                }
+                            }
+                        }
+
+                        let new_pos =
+                            collision.update_check_collision(dt, &velocity.normalize(), speed);
+                        gpu.camera.eye = new_pos;
+
+                        gpu.camera.update_target();
+                        gpu.camera_planes =
+                            Planes::build_plane_from_matrix4(gpu.camera.make_camera());
+
+                        let new_matrix: [[f32; 4]; 4] = gpu.camera.make_camera().into();
+                        gpu.queue.write_buffer(
+                            &gpu.camera_buffer,
+                            0,
+                            bytemuck::cast_slice(&new_matrix),
+                        );
+                        gpu.camera.is_moving = false;
+                    }
+                }
+                _ => {
+                    if self.should_draw {
+                        let _ = self.update_last_time();
+                        self.should_draw = false;
+                    } else {()}
+                },
             }
         };
     }
