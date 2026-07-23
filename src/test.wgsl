@@ -15,7 +15,7 @@ struct VxIn {
 
 struct FragOut {
     @builtin(position) pos: vec4f,
-    @location(3) light_pos: vec4f,
+    // @location(3) light_pos: vec4f,
     @location(0) uv: vec2f,
     @location(1) normal: vec3f,
 }
@@ -24,7 +24,7 @@ struct FragOut {
 fn vs_main(input: VxIn) -> FragOut {
     return FragOut(
         camera * model_matrix * vec4<f32>(input.pos, 1.0),
-        camera * vec4<f32>(3.0, -3.0, 1.0, 1.0),
+        // camera * vec4<f32>(3.0, -3.0, 1.0, 1.0),
         vec2<f32>(input.uv),
         vec3<f32>(input.normal)
     );
@@ -33,4 +33,5 @@ fn vs_main(input: VxIn) -> FragOut {
 @fragment
 fn fs_main(in: FragOut) -> @location(0) vec4f {
     return textureSample(t, s, in.uv);
+    //return vec4<f32>(in.uv.x, in.uv.y, in.uv.x * in.uv.y, 1.0);
 };
