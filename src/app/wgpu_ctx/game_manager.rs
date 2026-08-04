@@ -4,7 +4,7 @@ pub enum GameLevel {
     Base,
 }
 
-#[pub_fields] 
+#[pub_fields]
 #[derive(Default)]
 pub struct PerformanceState {
     low: bool,
@@ -38,13 +38,14 @@ pub enum GameState {
     Loading,
 }
 
-#[pub_fields] 
+#[pub_fields]
 pub struct FileManager {
     model_paths: Vec<String>,
+    transparency_paths: Vec<String>,
     audio_paths: Vec<String>,
 }
 
-#[pub_fields] 
+#[pub_fields]
 #[derive(Default)]
 pub struct InputState {
     w: bool,

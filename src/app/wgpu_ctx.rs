@@ -1,40 +1,49 @@
-use std::collections::HashMap;
-use std::sync::{Arc, atomic::{AtomicBool, AtomicU32}};
-use std::sync::mpsc::channel;
-use pub_fields::pub_fields;
-use winit::window::{CursorGrabMode, Window};
-use std::thread;
 use game_manager::{GameState, PerformanceState};
-use scene::{ResultSent, meshes::Meshes};
+use glam::Vec3;
+use pub_fields::pub_fields;
 use rapier3d::{
-    dynamics::{ImpulseJointSet,RigidBodySet},
-    geometry::ColliderSet
+    dynamics::{ImpulseJointSet, RigidBodySet},
+    geometry::ColliderSet,
 };
-use scene::audio;
 use rayon::prelude::*;
+use scene::audio;
+use scene::{ResultSent, meshes::Meshes};
+use std::collections::HashMap;
 use std::path::Path;
-use std::time::Instant;
 use std::sync::Mutex;
+use std::sync::mpsc::channel;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, AtomicU32},
+};
+use std::thread;
+use std::time::Instant;
+use winit::window::{CursorGrabMode, Window};
+pub mod game_manager;
 pub mod scene;
 pub mod ui;
-pub mod game_manager;
 pub mod wgpu_helper;
+use crate::{
+    app::wgpu_ctx::{
+        scene::{AllPipeline, camera::Light, meshes::collision::DoorAndJoint}, wgpu_helper::{create_early_depth_pipeline, create_light_pipeline},
+    }, create_pp_layout, p3, v3,
+};
+use scene::{
+    RenderCtx, Scene,
+    camera::{Camera, Planes, UniformCamera},
+};
+use scene::{camera::LightCtx, meshes};
 use ui::ui_helper;
-use scene::meshes;
+use wgpu::util::{BufferInitDescriptor, DeviceExt};
 
-#[pub_fields] 
+#[pub_fields]
 pub struct WgpuCtx {
     surface: wgpu::Surface<'static>,
     device: wgpu::Device,
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
-    pipeline: wgpu::RenderPipeline,
-    camera_bind_group: wgpu::BindGroup,
-    camera_buffer: wgpu::Buffer,
-    camera: scene::camera::Camera,
-    camera_planes: scene::camera::Planes,
-    texture_layout: wgpu::BindGroupLayout,
-    mbg_layout: wgpu::BindGroupLayout,
+    render_ctx: Option<RenderCtx>,
+    light_ctx: Option<LightCtx>,
     scene: scene::Scene,
     depth_view: wgpu::TextureView,
     collision: scene::meshes::collision::Collision,
@@ -62,6 +71,53 @@ impl WgpuCtx {
                 Some((frame, view))
             }
             _ => None,
+        }
+    }
+
+    pub fn draw_meshes(
+        &self,
+        meshes: &Vec<Meshes>,
+        render_pass: &mut wgpu::RenderPass,
+        with_tt: bool,
+    ) {
+        let Some(render_ctx) = &self.render_ctx else {
+            panic!("cant get renderctx")
+        };
+
+        for (_, mesh) in meshes.iter().enumerate() {
+            render_pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
+            render_pass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+            for primitive in &mesh.primitives {
+                if render_ctx
+                    .camera
+                    .take_plane()
+                    .frustum_culling(primitive.min, primitive.max)
+                {
+                    if with_tt {
+                        render_pass.set_bind_group(
+                            1,
+                            &mesh.textures[primitive.texture_id].texture,
+                            &[],
+                        );
+                        render_pass.set_bind_group(
+                            2,
+                            &mesh.bind_group_matrices,
+                            &[primitive.offset_buffer],
+                        );
+                    } else {
+                        render_pass.set_bind_group(
+                            1,
+                            &mesh.bind_group_matrices,
+                            &[primitive.offset_buffer],
+                        );
+                    }
+                    render_pass.draw_indexed(
+                        primitive.start..(primitive.start + primitive.count),
+                        0,
+                        0..1,
+                    );
+                }
+            }
         }
     }
 
@@ -198,11 +254,19 @@ impl WgpuCtx {
                     egui.add_space(150.0);
 
                     // fov
-                    let (fov, fov_val) =
-                        ui_helper::layout_sld_ui(egui, "Fov", &mut self.camera.fov, "fov", 30..120);
+                    let Some(rd_ctx) = &mut self.render_ctx else {
+                        panic!("cant get render ctx");
+                    };
+                    let (fov, fov_val) = ui_helper::layout_sld_ui(
+                        egui,
+                        "Fov",
+                        &mut rd_ctx.camera.fov,
+                        "fov",
+                        30..120,
+                    );
                     if fov.clicked() || fov.drag_stopped() {
-                        self.camera.fov = fov_val;
-                        self.camera.is_moving = true;
+                        rd_ctx.camera.fov = fov_val;
+                        rd_ctx.camera.is_moving = true;
                     };
                     egui.add_space(5.0);
                     // sound (deadcode)
@@ -225,7 +289,8 @@ impl WgpuCtx {
                                 .font(egui::FontId::monospace(30.0)),
                         );
                         ui.add_space(80.0);
-                        if ui_helper::layout_chb_ui(ui, "30", "30_chb", &self.fps_state.low).clicked()
+                        if ui_helper::layout_chb_ui(ui, "30", "30_chb", &self.fps_state.low)
+                            .clicked()
                         {
                             self.fps_state = PerformanceState {
                                 low: !self.fps_state.low,
@@ -233,7 +298,8 @@ impl WgpuCtx {
                             };
                             fps = 30.0;
                         };
-                        if ui_helper::layout_chb_ui(ui, "60", "60_chb", &self.fps_state.mid).clicked()
+                        if ui_helper::layout_chb_ui(ui, "60", "60_chb", &self.fps_state.mid)
+                            .clicked()
                         {
                             self.fps_state = PerformanceState {
                                 mid: !self.fps_state.mid,
@@ -241,7 +307,9 @@ impl WgpuCtx {
                             };
                             fps = 60.0;
                         };
-                        if ui_helper::layout_chb_ui(ui, "90", "90_chb", &self.fps_state.ok).clicked() {
+                        if ui_helper::layout_chb_ui(ui, "90", "90_chb", &self.fps_state.ok)
+                            .clicked()
+                        {
                             self.fps_state = PerformanceState {
                                 ok: !self.fps_state.ok,
                                 ..Default::default()
@@ -394,135 +462,382 @@ impl WgpuCtx {
     pub fn load_all(&mut self, scene_name: String) {
         self.should_load
             .store(false, std::sync::atomic::Ordering::Relaxed);
+        self.scene.loaded = false;
         let (sd, rr) = channel::<ResultSent>();
         self.scene.rr = rr;
+        let file_manager = &self
+            .file_manager
+            .get(&scene_name)
+            .expect("cant get file manager");
         let (
             m_paths,
+            t_paths,
             a_paths,
-            texture_layout_clone,
-            mbg_layout_clone,
             mut impulse_joint,
-            mut joints_handle,
-            mut doors_handle,
+            mut door_joint_handles,
             mut rbs,
             mut cs,
             progress_clone,
             device,
             queue,
-            pos_cam,
+            config,
         ) = (
-            self.file_manager
-                .get(&scene_name)
-                .expect("no scene name")
-                .model_paths
-                .clone(),
-            self.file_manager
-                .get(&scene_name)
-                .expect("no scene name")
-                .audio_paths
-                .clone(),
-            self.texture_layout.clone(),
-            self.mbg_layout.clone(),
+            file_manager.model_paths.clone(),
+            file_manager.transparency_paths.clone(),
+            file_manager.audio_paths.clone(),
             ImpulseJointSet::new(),
-            Vec::new(),
-            Vec::new(),
+            HashMap::new(),
             RigidBodySet::new(),
             ColliderSet::new(),
             Arc::clone(&self.loader_progress),
             self.device.clone(),
             self.queue.clone(),
-            self.camera.eye.into(),
+            self.config.clone(),
         );
 
-        thread::spawn(move || {
-            let counter = Instant::now();
-            let mut progress_counter: f32 = 0.0;
-            let mut path_buf = String::with_capacity(64);
+        thread::Builder::new()
+            .name(format!("thread loader for scene {}", scene_name))
+            .spawn(move || {
+                let counter = Instant::now();
+                let mut progress_counter: f32 = 0.0;
+                let mut path_buf = String::with_capacity(64);
 
-            let mut audio = audio::Audio::new();
-            let progress_audio: f32 = 20.0 / a_paths.len() as f32;
-            for path in a_paths {
-                path_buf.clear();
-                path_buf.push_str("./assets/audio/");
-                path_buf.push_str(&path);
-                let Some(path_name) = Path::new(&path).file_stem() else {
-                    panic!("no path")
+                let mut audio = audio::Audio::new();
+                let progress_audio: f32 = 20.0 / a_paths.len() as f32;
+                for path in a_paths {
+                    path_buf.clear();
+                    path_buf.push_str("./assets/audio/");
+                    path_buf.push_str(&path);
+                    let Some(path_name) = Path::new(&path).file_stem() else {
+                        panic!("no path")
+                    };
+                    let Some(name) = path_name.to_str() else {
+                        panic!("no path name")
+                    };
+                    audio.load(name, &path_buf);
+                    progress_counter += progress_audio;
+                    progress_clone.store(
+                        progress_counter.floor() as u32,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                }
+
+                let texture_layout =
+                    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                        label: Some("tt layout"),
+                        entries: &[
+                            wgpu::BindGroupLayoutEntry {
+                                binding: 0,
+                                visibility: wgpu::ShaderStages::FRAGMENT,
+                                ty: wgpu::BindingType::Texture {
+                                    sample_type: wgpu::TextureSampleType::Float {
+                                        filterable: true,
+                                    },
+                                    view_dimension: wgpu::TextureViewDimension::D2,
+                                    multisampled: false,
+                                },
+                                count: None,
+                            },
+                            wgpu::BindGroupLayoutEntry {
+                                binding: 1,
+                                visibility: wgpu::ShaderStages::FRAGMENT,
+                                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                                count: None,
+                            },
+                        ],
+                    });
+
+                let model_bind_group_layout =
+                    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                        label: Some("model_matrices_bind_group_layout"),
+                        entries: &[wgpu::BindGroupLayoutEntry {
+                            binding: 0,
+                            visibility: wgpu::ShaderStages::VERTEX,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Uniform,
+                                has_dynamic_offset: true,
+                                min_binding_size: std::num::NonZero::new(64),
+                            },
+                            count: None,
+                        }],
+                    });
+
+                let mut camera = Camera {
+                    eye: (0.0, 2.7, 5.0).into(),
+                    target: (0.0, 0.0, 0.0).into(),
+                    up: Vec3::Y,
+                    aspect: config.width as f32 / config.height as f32,
+                    fov: 75.0,
+                    near: 0.01,
+                    far: 75.0,
+                    yaw: -90.0,
+                    pitch: 0.0,
+                    is_moving: true,
+                    is_rotating: true,
+                    planes: None,
                 };
-                let Some(name) = path_name.to_str() else {
-                    panic!("no path name")
-                };
-                audio.load(name, &path_buf);
-                progress_counter += progress_audio;
-                progress_clone.store(
-                    progress_counter.floor() as u32,
-                    std::sync::atomic::Ordering::Relaxed,
-                );
-            }
-            println!("Loaded radio in {}ms", counter.elapsed().as_millis());
 
-            let mutex_meshes: Mutex<Vec<Meshes>> = Mutex::new(Vec::with_capacity(m_paths.len()));
-            let progress_mesh = 70.0 / m_paths.len() as f32;
-            m_paths.par_iter().for_each(|path| {
-                let mesh = scene::load_model(
-                    &path,
-                    &device,
-                    &queue,
-                    &texture_layout_clone,
-                    &mbg_layout_clone,
-                );
-                let mut lock = mutex_meshes.lock().expect("cant get lock");
-                lock.push(mesh);
-                progress_clone.store(
-                    (progress_counter + progress_mesh).floor() as u32,
-                    std::sync::atomic::Ordering::Relaxed,
-                );
-            });
+                let pos_cam: [f32; 3] = camera.eye.into();
 
-            let meshes = mutex_meshes.into_inner().expect("no mesh found");
-            let progress_physics = 10.0 / meshes.len() as f32;
-            for mesh in &meshes {
-                for primitive in &mesh.primitives {
-                    if !primitive.is_door.door {
-                        meshes::load_static_collider(&primitive, &mut rbs, &mut cs);
-                    }
-                    if primitive.is_door.door && !(mesh.doors.len() == 0) {
-                        if let Some(i) = primitive.is_door.id {
-                            let id = i as usize;
-                            let (door_handle, joint_handle) =
-                            meshes::load_door_collider(
-                                primitive,
-                                &mut rbs,
-                                &mut cs,
-                                &mesh.doors,
-                                id,
-                                &mut impulse_joint,
-                            );
-                            doors_handle.push(door_handle);
-                            joints_handle.push(joint_handle);
+                let mutex_meshes: Mutex<Vec<Meshes>> =
+                    Mutex::new(Vec::with_capacity(m_paths.len()));
+                let progress_mesh = 40.0 / m_paths.len() as f32;
+                let progress_mesh_step = (progress_mesh as u32).max(1);
+                m_paths.par_iter().for_each(|path| {
+                    let mesh = scene::load_model(
+                        &path,
+                        &device,
+                        &queue,
+                        &texture_layout,
+                        &model_bind_group_layout,
+                    );
+                    let mut lock = mutex_meshes.lock().expect("cant get lock");
+                    lock.push(mesh);
+                    progress_clone
+                        .fetch_add(progress_mesh_step, std::sync::atomic::Ordering::Relaxed);
+                });
+
+                let mutex_transparency: Mutex<Vec<Meshes>> =
+                    Mutex::new(Vec::with_capacity(t_paths.len()));
+                let progress_t = 30.0 / t_paths.len() as f32;
+                let progress_t_step = (progress_t as u32).max(1);
+                t_paths.par_iter().for_each(|path| {
+                    let mesh = scene::load_model(
+                        &path,
+                        &device,
+                        &queue,
+                        &texture_layout,
+                        &model_bind_group_layout,
+                    );
+                    let mut lock = mutex_transparency.lock().expect("cant get lock");
+                    lock.push(mesh);
+                    progress_clone.fetch_add(progress_t_step, std::sync::atomic::Ordering::Relaxed);
+                });
+                let transparency_meshes = mutex_transparency
+                    .into_inner()
+                    .expect("no transparency found");
+
+                let mut meshes = mutex_meshes.into_inner().expect("no mesh found");
+                scene::flat_world_doors(&mut meshes);
+                let progress_physics = 10.0 / meshes.len() as f32;
+                let progress_physics_step = (progress_physics as u32).max(1);
+                for mesh in &meshes {
+                    for primitive in &mesh.primitives {
+                        if !primitive.is_door.door {
+                            meshes::load_static_collider(&primitive, &mut rbs, &mut cs);
+                        } else if primitive.is_door.door && !(mesh.doors.len() == 0) {
+                            if let Some(i) = primitive.is_door.id {
+                                let id = i as usize;
+                                let (door_handle, joint_handle, id_door) = meshes::load_door_collider(
+                                    &primitive,
+                                    &mut rbs,
+                                    &mut cs,
+                                    &mesh.doors,
+                                    id,
+                                    &mut impulse_joint,
+                                );
+                                door_joint_handles.entry(id_door).or_insert_with(|| {
+                                    DoorAndJoint { door_handle, joint_handle }
+                                });
+                            }
                         }
                     }
+                    progress_clone
+                        .fetch_add(progress_physics_step, std::sync::atomic::Ordering::Relaxed);
                 }
-                progress_counter += progress_physics;
-                progress_clone.store(
-                    progress_counter.floor() as u32,
-                    std::sync::atomic::Ordering::Relaxed,
+
+                let (char_handle, char_controller) =
+                    meshes::load_player_collision(&pos_cam, &mut rbs, &mut cs);
+
+                let light_layout =
+                    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                        label: Some("light_bg_layout"),
+                        entries: &[wgpu::BindGroupLayoutEntry {
+                            binding: 0,
+                            visibility: wgpu::ShaderStages::VERTEX,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Uniform,
+                                has_dynamic_offset: true,
+                                min_binding_size: std::num::NonZeroU64::new(256),
+                            },
+                            count: None,
+                        }],
+                    });
+
+                let light_shader =
+                    device.create_shader_module(wgpu::include_wgsl!("../light.wgsl"));
+                let pipeline_light_layout =
+                    create_pp_layout!(&device, [&light_layout, &model_bind_group_layout]);
+                let light_pipeline =
+                    create_light_pipeline(&device, &pipeline_light_layout, &light_shader);
+                let shadow_layout = wgpu_helper::create_shadow_bg_layout(&device);
+
+                let lights = vec![
+                    Light::new_light(
+                        p3!(-15.0, 8.0, 5.0),
+                        v3!(1.0, -0.3, -0.2),
+                        -10.0,
+                        10.0,
+                        10.0,
+                        -10.0,
+                        0.1,
+                        1.0,
+                        3.0,
+                        [0.6, 0.6, 0.5, 1.0],
+                    ),
+                    Light::new_light(
+                        p3!(15.0, 8.0, 0.0),
+                        v3!(-1.0, -0.3, -0.2),
+                        -10.0,
+                        10.0,
+                        10.0,
+                        -10.0,
+                        0.1,
+                        1.0,
+                        3.0,
+                        [0.4, 0.4, 0.5, 1.0],
+                    ),
+                ];
+                let light_tt: (Vec<wgpu::TextureView>, wgpu::Sampler, wgpu::TextureView) =
+                    scene::Scene::create_shadow_tt(&device, 1024, 1024, &lights);
+
+                let shadow_bg = Scene::create_shadow_bindgroup(
+                    &device,
+                    &shadow_layout,
+                    &light_tt.2,
+                    &light_tt.1,
+                    &lights,
                 );
-            }
 
-            let (char_handle, char_controller) = meshes::load_player_collision(&pos_cam, &mut rbs, &mut cs);
+                let light_ctx = LightCtx::new(
+                    Scene::create_light_bindgroup(&device, &light_layout, &lights),
+                    light_tt.0,
+                    shadow_bg,
+                    light_tt.2,
+                    light_pipeline,
+                );
 
-            let _ = sd.send(ResultSent {
-                meshes,
-                impulse_joint: impulse_joint,
-                doors_handle: doors_handle,
-                joints_handle: joints_handle,
-                rbs: rbs,
-                cs: cs,
-                char_handle,
-                char_controller,
-                audio,
-            });
-            println!("Loaded in {}ms", counter.elapsed().as_millis());
-        });
+                let camera_bind_group_layout =
+                    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                        label: Some("camera and model Layout"),
+                        entries: &[wgpu::BindGroupLayoutEntry {
+                            binding: 0,
+                            visibility: wgpu::ShaderStages::VERTEX,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Uniform,
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        }],
+                    });
+
+                let camera_uniform = camera.make_camera();
+                let planes = Planes::build_plane_from_matrix4(camera_uniform);
+                camera.planes = Some(planes);
+                let camera_uniform = UniformCamera {
+                    uniform: camera_uniform,
+                };
+
+                let camera_buffer = device.create_buffer_init(&BufferInitDescriptor {
+                    label: Some("cmr_buffer"),
+                    contents: bytemuck::bytes_of(&camera_uniform.uniform),
+                    usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                });
+
+                let shader = device.create_shader_module(wgpu::include_wgsl!("../main.wgsl"));
+                let early_depth_shader =
+                    device.create_shader_module(wgpu::include_wgsl!("../early_depth.wgsl"));
+
+                let pipeline_basic_layout = create_pp_layout!(
+                    &device,
+                    [
+                        &camera_bind_group_layout,
+                        &texture_layout,
+                        &model_bind_group_layout,
+                        &shadow_layout,
+                    ]
+                );
+
+                let early_depth_layout = create_pp_layout!(
+                    &device,
+                    [&camera_bind_group_layout, &model_bind_group_layout]
+                );
+                let early_depth_pipeline =
+                    create_early_depth_pipeline(&device, &early_depth_layout, &early_depth_shader);
+
+                let render_pipeline = wgpu_helper::create_basic_pipeline(
+                    &device,
+                    &pipeline_basic_layout,
+                    &shader,
+                    &config,
+                );
+
+                let transparency_pipeline = wgpu_helper::create_transparency_pipeline(
+                    &device,
+                    &pipeline_basic_layout,
+                    &shader,
+                    &config,
+                );
+
+                let camera_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("camera bind group"),
+                    layout: &camera_bind_group_layout,
+                    entries: &[wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: camera_buffer.as_entire_binding(),
+                    }],
+                });
+
+                let pipeline = AllPipeline {
+                    render_pipeline,
+                    transparency_pipeline,
+                    early_depth_pipeline,
+                };
+
+                let render_ctx = RenderCtx {
+                    pipeline,
+                    camera_bind_group,
+                    camera_buffer,
+                    camera,
+                    mbg_layout: model_bind_group_layout,
+                    texture_layout,
+                };
+
+                let _ = sd.send(ResultSent {
+                    meshes,
+                    transparency_meshes,
+                    impulse_joint: impulse_joint,
+                    door_joint_handles,
+                    rbs: rbs,
+                    cs: cs,
+                    char_handle,
+                    char_controller,
+                    audio,
+                    lights,
+                    light_ctx,
+                    render_ctx,
+                });
+                println!("Loaded all in {}ms", counter.elapsed().as_millis());
+            })
+            .expect("cant create thread");
+    }
+
+    pub fn update_loaded(&mut self, result: ResultSent) {
+        let collision = &mut self.collision;
+        self.game_state = GameState::Menu;
+        self.scene.meshes = result.meshes;
+        self.scene.transparency_meshes = result.transparency_meshes;
+        self.scene.lights = result.lights;
+        collision.rbs = result.rbs;
+        collision.cs = result.cs;
+        collision.impulse_joint = result.impulse_joint;
+        collision.door_joint_handles = result.door_joint_handles;
+        collision.char_controller = result.char_controller;
+        collision.char_handle = result.char_handle;
+        self.audio = result.audio;
+        self.render_ctx = Some(result.render_ctx);
+        self.light_ctx = Some(result.light_ctx);
+        self.scene.loaded = true;
     }
 }

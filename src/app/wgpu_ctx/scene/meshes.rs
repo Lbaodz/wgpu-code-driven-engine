@@ -1,50 +1,50 @@
-use serde::{Deserialize, Serialize};
 use bytemuck::{Pod, Zeroable};
-use cgmath::{Matrix4, Point3, Quaternion, Vector3, dot};
+use glam::{Mat4, Quat};
+use pub_fields::pub_fields;
 use rapier3d::{
     control::{CharacterAutostep, CharacterLength, KinematicCharacterController},
     dynamics::{
-        ImpulseJointSet, RigidBodyBuilder, RigidBodySet,
-        ImpulseJointHandle, RevoluteJointBuilder, RigidBodyHandle
+        ImpulseJointHandle, ImpulseJointSet, RevoluteJointBuilder, RigidBodyBuilder,
+        RigidBodyHandle, RigidBodySet,
     },
-    geometry::{
-        ColliderBuilder, ColliderSet, InteractionGroups, InteractionTestMode, Group
-    },
+    geometry::{ColliderBuilder, ColliderSet, Group, InteractionGroups, InteractionTestMode},
     math::Vec3,
     pipeline::QueryFilter,
 };
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::f32::consts::FRAC_PI_2;
-use pub_fields::pub_fields;
 pub mod collision;
 
 const DYN: Group = Group::GROUP_1;
 const STA: Group = Group::GROUP_2;
 const DOR: Group = Group::GROUP_3;
 
-#[pub_fields] 
+#[pub_fields]
+#[repr(C)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct Door {
     lock_pos: Vec3,
     lock_for_door: Vec3,
-    scale: Vector3<f32>,
+    scale: Vec3,
 }
 
-#[pub_fields] 
+#[pub_fields]
 #[derive(Deserialize, Serialize, Clone, Debug)]
 pub struct IsDoor {
     id: Option<u32>,
     door: bool,
 }
 
-#[pub_fields] 
+#[pub_fields]
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable, Debug)]
 pub struct ModelMatrix {
-    matrix: [[f32; 4]; 4],
+    matrix: Mat4,
     pad: [u32; 48],
 }
 
-#[pub_fields] 
+#[pub_fields]
 #[repr(C)]
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable, Deserialize, Serialize)]
 pub struct Vertex {
@@ -68,18 +68,20 @@ pub struct Primitive {
 }
 
 #[pub_fields]
+#[derive(Debug)]
 pub struct Texture {
     texture: wgpu::BindGroup,
 }
 
 #[pub_fields]
+#[derive(Debug)]
 pub struct Meshes {
-    vertex_buffer: wgpu::Buffer, // in runtime
-    index_buffer: wgpu::Buffer,  // in runtime
+    vertex_buffer: wgpu::Buffer,
+    index_buffer: wgpu::Buffer,
     primitives: Vec<Primitive>,
-    textures: Vec<Texture>,               // in runtime
-    bind_group_matrices: wgpu::BindGroup, // in runtime
-    buffer_matrices: wgpu::Buffer,        // in runtime
+    textures: Vec<Texture>,
+    bind_group_matrices: wgpu::BindGroup,
+    buffer_matrices: wgpu::Buffer,
     doors: HashMap<u32, Door>,
 }
 
@@ -95,31 +97,17 @@ pub struct BakedTexture {
 #[pub_fields]
 #[repr(C)]
 #[derive(Debug, Deserialize, Serialize, Clone)]
-pub struct BakedDoor {
-    lock_pos: [f32; 3],
-    lock_for_door: [f32; 3],
-    scale: [f32; 3],
-}
-
-#[pub_fields]
-#[repr(C)]
-#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct BakedMeshes {
     vertex: Vec<Vertex>,
     index: Vec<u32>,
     primitives: Vec<Primitive>,
     baked_texture: Vec<BakedTexture>,
-    matrices: Vec<[[f32; 4]; 4]>,
-    doors: HashMap<u32, BakedDoor>,
+    matrices: Vec<Mat4>,
+    doors: HashMap<u32, Door>,
 }
 
 impl collision::Collision {
-    pub fn update_check_collision(
-        &mut self,
-        dt: f32,
-        desire_movement: &Vector3<f32>,
-        speed: f32,
-    ) -> Point3<f32> {
+    pub fn update_check_collision(&mut self, dt: f32, desire_movement: &Vec3, speed: f32) -> Vec3 {
         let char_data = &self.rbs[self.char_handle];
         let char_collider_handle = char_data.colliders()[0];
         let (character_shape, character_pos) = (
@@ -162,34 +150,33 @@ impl collision::Collision {
         let rb = &mut self.rbs[self.char_handle];
         let new_pos = rb.position().translation + movement_result.translation;
         rb.set_next_kinematic_translation(new_pos);
-        Point3::new(new_pos.x, new_pos.y + 2.25, new_pos.z)
+        Vec3::new(new_pos.x, new_pos.y + 2.25, new_pos.z)
     }
 
     pub fn need_update_door(&mut self) -> bool {
         let mut should_check: Vec<bool> = Vec::new();
         let mut not_closed: bool = false;
-        for i in 0..self.joints_handle.len() {
+        for i in 0..self.door_joint_handles.len() {
             let joint = &self
                 .impulse_joint
-                .get_mut(self.joints_handle[i], false)
+                .get_mut(self.door_joint_handles.get(&(i as u32)).expect("no door from id").joint_handle, false)
                 .expect("no joint handle");
             let door = &self.rbs[joint.body2()];
             let door_rot = door.rotation();
             let angle = door_rot.to_euler(rapier3d::glamx::EulerRot::XYZ);
             not_closed = angle.1.abs() > 0.01;
             let angvel_y = door.angvel().y;
-            let pos = angvel_y > 0.01;
-            let neg = angvel_y < -0.01;
-            should_check.push(pos || neg);
+            let open = angvel_y.abs() > 0.01;
+            should_check.push(open);
         }
         should_check.into_iter().any(|s| s) || not_closed
     }
 
-    pub fn update_door(&mut self, forward: &Vector3<f32>) {
-        for i in 0..self.joints_handle.len() {
+    pub fn update_door(&mut self, forward: &Vec3) {
+        for i in 0..self.door_joint_handles.len() {
             let joint = &mut self
                 .impulse_joint
-                .get_mut(self.joints_handle[i], false)
+                .get_mut(self.door_joint_handles.get(&(i as u32)).expect("no door from id").joint_handle, false)
                 .expect("no joint handle");
             let door = &mut self.rbs[joint.body2()];
             let door_rot = door.rotation();
@@ -199,61 +186,112 @@ impl collision::Collision {
             let angvel_y = door.angvel().y;
             let curr_angle_abs = curr_angle.abs();
 
-            /*  let imp = joint.impulses;
-            let force =
-                imp.iter().enumerate().filter(|(index, _)| *index != 3 ).any(
-                    |(_, b)| b.abs() < 0.05
-                ); */
-
             let door_forw = door_rot * Vec3::X;
-            let dot = dot(
-                Vector3::new(door_forw.x, door_forw.y, door_forw.z),
-                *forward,
-            ) * 0.5
-                + 0.5;
-            let pos = dot < 0.5 || angvel_y > 2.0;
-            let neg = dot > 0.5 || angvel_y < -2.0;
+            let dot = Vec3::new(door_forw.x, door_forw.y, door_forw.z).dot(*forward) * 0.5 + 0.5;
+            let pos = dot < 0.5 || (angvel_y > 0.5 && angvel_y < 2.0);
+            let neg = dot > 0.5 || (angvel_y < -0.5 && angvel_y > -2.0);
 
             // when closed + no force or force
             if curr_angle_abs < 0.0001 {
                 if pos {
                     data.set_limits(rapier3d::dynamics::JointAxis::AngX, [0.0, FRAC_PI_2]);
+                    door.wake_up(true);
+                    println!("pos: {angvel_y}");
                 } else if neg {
                     data.set_limits(rapier3d::dynamics::JointAxis::AngX, [-FRAC_PI_2, 0.0]);
+                    door.wake_up(true);
+                    println!("neg: {angvel_y}");
                 } else {
                     data.set_limits(rapier3d::dynamics::JointAxis::AngX, [-0.005, 0.005]);
+                    println!("neither: {angvel_y}");
                 }
             } else {
-                door.wake_up(true);
+                if door.is_sleeping() && (pos || neg) {
+                    door.wake_up(true);
+                }
             }
         }
     }
 
-    pub fn check_door(
-        &self,
+    pub fn new_door_min_max(&self, id: u128) -> ([f32; 3], [f32; 3]) {
+        let mut min_max: ([f32; 3], [f32; 3]) = ([0.0; 3], [0.0; 3]);
+        for i in 0..self.door_joint_handles.len() {
+            let rb = &self.rbs[self.door_joint_handles.get(&(i as u32)).expect("no door from id").door_handle];
+            let col_handle = self.cs.get(rb.colliders()[0]).expect("no collider door");
+            if col_handle.user_data == id {
+                let aabb = col_handle.compute_aabb();
+                min_max = (aabb.mins.into(), aabb.maxs.into());
+                return min_max;
+            }
+        }
+        min_max
+    }
+
+    pub fn update_matrix_door(
+        &mut self,
+        id: u32,
         doors: &HashMap<u32, Door>,
         primitive: &Primitive,
-    ) -> Vec<(Option<Matrix4<f32>>, Option<u32>)> {
-        let index = doors.len();
-        (0..index)
-            .map(|i| {
-                let door_pos = self.rbs[self.doors_handle[i]].position();
-                let translation = door_pos.translation;
-                let rot = door_pos.rotation;
-                let sca = doors
-                    .get(&(i as u32))
-                    .expect("no door found from id :(")
-                    .scale;
-                let t = Matrix4::from_translation(Vector3::new(
-                    translation.x,
-                    translation.y,
-                    translation.z,
-                ));
-                let r = Matrix4::from(Quaternion::new(rot.w, rot.x, rot.y, rot.z));
-                let s = Matrix4::from_nonuniform_scale(sca.x, sca.y, sca.z);
-                (Some(t * r * s), Some(primitive.offset_buffer))
-            })
-            .collect::<Vec<(Option<Matrix4<f32>>, Option<u32>)>>()
+        queue: &wgpu::Queue,
+        buffer: &wgpu::Buffer,
+    ) {
+        if self.need_update_matrix_door(id) {
+            let door = &mut self.rbs[self.door_joint_handles.get(&id).expect("no door from id").door_handle];
+            door.wake_up(true);
+            let door_pos = door.position();
+            let translation = door_pos.translation;
+            let rot = door_pos.rotation;
+            let sca = doors.get(&id).expect(&id.to_string()).scale;
+            let t = Mat4::from_translation(Vec3::new(translation.x, translation.y, translation.z));
+            let r = Mat4::from_quat(Quat::from_xyzw(rot.x, rot.y, rot.z, rot.w));
+            let s = Mat4::from_scale(Vec3::new(sca.x, sca.y, sca.z));
+            let model_matrix = t * r * s;
+
+            queue.write_buffer(
+                buffer,
+                primitive.offset_buffer as u64,
+                bytemuck::bytes_of(&model_matrix),
+            );
+        }
+    }
+
+    fn need_update_matrix_door(&self, id: u32) -> bool {
+        let door_rb_handle = self.door_joint_handles.get(&id).expect("no door from id").door_handle; // loaded indexed by file parser
+        let char_rb_handle = self.char_handle;
+
+        if let (Some(door_rb), Some(char_rb)) =
+            (self.rbs.get(door_rb_handle), self.rbs.get(char_rb_handle))
+        {
+            if let (Some(&door_col), Some(&char_col)) =
+                (door_rb.colliders().first(), char_rb.colliders().first())
+            {
+                let door_collider = self.cs.get(door_col).expect("no collider from handle");
+                let y_vel = door_rb.angvel().y.abs() > 0.01;
+                let y = door_collider
+                    .rotation()
+                    .to_euler(rapier3d::glamx::EulerRot::XYZ)
+                    .1
+                    .abs()
+                    > 0.01;
+                return if y_vel || y {
+                    true
+                } else if let Some(contact_pair) =
+                    self.narrow_phase.contact_pair(door_col, char_col)
+                {
+                    if contact_pair.has_any_active_contact() {
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+            } else {
+                false
+            }
+        } else {
+            false
+        }
     }
 }
 
@@ -264,8 +302,12 @@ pub fn load_door_collider(
     doors: &HashMap<u32, Door>,
     id: usize,
     joints: &mut ImpulseJointSet,
-) -> (RigidBodyHandle, ImpulseJointHandle) {
+) -> (RigidBodyHandle, ImpulseJointHandle, u32) {
     let door_group = InteractionGroups::new(DOR, DYN, InteractionTestMode::Or);
+    let door_data = doors
+        .get(&(id as u32))
+        .expect(format!("no door from id {id}").as_str());
+    println!("{id}, {}", primitive.is_door.id.unwrap());
     let extent = primitive.extent;
     let center = primitive.center;
     let door = RigidBodyBuilder::dynamic()
@@ -278,12 +320,13 @@ pub fn load_door_collider(
 
     let collider =
         ColliderBuilder::cuboid(extent[0] + offset, extent[1] + offset, extent[2] + offset)
+            .user_data(id as u128)
             .collision_groups(door_group)
             .density(5.0)
             .build();
     cs.insert_with_parent(collider, door_handle, rbs);
 
-    let lp = doors.get(&(id as u32)).expect("no door from id").lock_pos;
+    let lp = door_data.lock_pos;
     let lock = RigidBodyBuilder::fixed().translation(lp).build();
     let lock_handle = rbs.insert(lock);
 
@@ -300,14 +343,10 @@ pub fn load_door_collider(
 
     let joint_handle = joints.insert(lock_handle, door_handle, joint, true);
 
-    (door_handle, joint_handle)
+    (door_handle, joint_handle, id as u32)
 }
 
-pub fn load_static_collider(
-    primitive: &Primitive,
-    rbs: &mut RigidBodySet,
-    cs: &mut ColliderSet
-) {
+pub fn load_static_collider(primitive: &Primitive, rbs: &mut RigidBodySet, cs: &mut ColliderSet) {
     let static_group = InteractionGroups::new(STA, DYN, InteractionTestMode::Or);
     let extent = primitive.extent;
     let center = primitive.center;

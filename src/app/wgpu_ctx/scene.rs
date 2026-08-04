@@ -1,58 +1,254 @@
-pub mod meshes;
-pub mod camera;
 pub mod audio;
-use std::collections::HashMap;
-use std::sync::mpsc::Receiver;
-use cgmath::{Quaternion, Matrix4,SquareMatrix, Vector3, Vector4};
+pub mod camera;
+pub mod meshes;
+use crate::app::wgpu_ctx::scene::camera::{LightData, LightDataAlign};
+use crate::app::wgpu_ctx::scene::meshes::collision::DoorAndJoint;
+use camera::{Light, LightCtx};
 use ctt::encoders::bc7enc::Bc7encSettings;
 use ctt::{ConvertSettings, Format, convert, encoders::Encoder};
 use ctt::{PipelineOutput, Surface};
+use glam::{Mat4, Quat, Vec4, Vec4Swizzles};
+use meshes::{
+    BakedMeshes, BakedTexture, Door, IsDoor, Meshes, ModelMatrix, Primitive, Texture, Vertex,
+};
+use pub_fields::pub_fields;
 use rapier3d::{
     control::KinematicCharacterController,
-    dynamics::{
-        ImpulseJointSet, RigidBodySet, ImpulseJointHandle, RigidBodyHandle
-    },
-    geometry::{
-        ColliderSet
-    },
+    dynamics::{ImpulseJointHandle, ImpulseJointSet, RigidBodyHandle, RigidBodySet},
+    geometry::ColliderSet,
     math::Vec3,
 };
-use meshes::{Vertex, BakedMeshes, Texture, Meshes, ModelMatrix, IsDoor, Primitive, Door, BakedTexture, BakedDoor};
-use std::fs;
-use wgpu::util::{DeviceExt, BufferInitDescriptor};
-use pub_fields::pub_fields;
+use std::collections::HashMap;
+use std::fs::File;
+use std::io::{Read, Write};
+use std::sync::Arc;
+use std::sync::mpsc::Receiver;
+use wgpu::RenderPipeline;
+use wgpu::TextureUsages;
+use wgpu::util::{BufferInitDescriptor, DeviceExt};
 pub mod scene_helper;
 
-#[pub_fields] 
+#[pub_fields]
+pub struct AllPipeline {
+    render_pipeline: RenderPipeline,
+    transparency_pipeline: RenderPipeline,
+    early_depth_pipeline: RenderPipeline,
+}
+
+#[pub_fields]
+pub struct RenderCtx {
+    pipeline: AllPipeline,
+    camera_bind_group: wgpu::BindGroup,
+    camera_buffer: wgpu::Buffer,
+    camera: camera::Camera,
+    texture_layout: wgpu::BindGroupLayout,
+    mbg_layout: wgpu::BindGroupLayout,
+}
+
+#[pub_fields]
 pub struct ResultSent {
-    meshes: Vec<meshes::Meshes>,
+    meshes: Vec<Meshes>,
+    transparency_meshes: Vec<Meshes>,
     impulse_joint: ImpulseJointSet,
-    doors_handle: Vec<RigidBodyHandle>,
-    joints_handle: Vec<ImpulseJointHandle>,
+    door_joint_handles: HashMap<u32, DoorAndJoint>,
     rbs: RigidBodySet,
     cs: ColliderSet,
     char_handle: RigidBodyHandle,
     char_controller: KinematicCharacterController,
     audio: audio::Audio,
+    lights: Vec<Light>,
+    light_ctx: LightCtx,
+    render_ctx: RenderCtx,
 }
 
-#[pub_fields] 
+#[pub_fields]
 pub struct Scene {
-    meshes: Vec<meshes::Meshes>,
+    meshes: Vec<Meshes>,
+    transparency_meshes: Vec<Meshes>,
+    lights: Vec<Light>,
     rr: Receiver<ResultSent>,
+    loaded: bool,
+}
+
+impl Scene {
+    pub fn create_shadow_tt(
+        device: &wgpu::Device,
+        res_x: u32,
+        res_y: u32,
+        lights: &Vec<Light>,
+    ) -> (Vec<wgpu::TextureView>, wgpu::Sampler, wgpu::TextureView) {
+        let tt = device.create_texture(&wgpu::wgt::TextureDescriptor {
+            label: Some("light tt arr"),
+            size: wgpu::Extent3d {
+                width: res_x,
+                height: res_y,
+                depth_or_array_layers: lights.len() as u32,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Depth32Float,
+            usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let view = (0..lights.len())
+            .map(|i| {
+                tt.create_view(&wgpu::TextureViewDescriptor {
+                    label: Some(&format!("arr tt view {}", i)),
+                    format: Some(wgpu::TextureFormat::Depth32Float),
+                    dimension: Some(wgpu::TextureViewDimension::D2),
+                    base_array_layer: i as u32,
+                    array_layer_count: Some(1),
+                    aspect: wgpu::TextureAspect::DepthOnly,
+                    base_mip_level: 0,
+                    mip_level_count: None,
+                    ..Default::default()
+                })
+            })
+            .collect();
+        let depth_view = tt.create_view(&wgpu::TextureViewDescriptor {
+            label: Some("shadow tt view"),
+            format: Some(wgpu::TextureFormat::Depth32Float),
+            dimension: Some(wgpu::TextureViewDimension::D2Array),
+            base_array_layer: 0,
+            array_layer_count: Some(lights.len() as u32),
+            ..Default::default()
+        });
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("sampler shadow"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            compare: Some(wgpu::CompareFunction::Less),
+            min_filter: wgpu::FilterMode::Linear,
+            mag_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+        (view, sampler, depth_view)
+    }
+
+    pub fn create_light_bindgroup(
+        device: &wgpu::Device,
+        bindgroup_layout: &wgpu::BindGroupLayout,
+        lights: &Vec<Light>,
+    ) -> wgpu::BindGroup {
+        let all_light_matrices: Vec<LightDataAlign> = lights
+            .iter()
+            .map(|l| LightDataAlign {
+                data: l.data,
+                _pad: [0; 40],
+            })
+            .collect();
+        let light_buffer = device.create_buffer_init(&BufferInitDescriptor {
+            label: Some("light mtx buffer"),
+            contents: bytemuck::cast_slice(&all_light_matrices),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("light_bindgroup"),
+            layout: bindgroup_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                    buffer: &light_buffer,
+                    offset: 0,
+                    size: std::num::NonZeroU64::new(256),
+                }),
+            }],
+        })
+    }
+
+    pub fn create_shadow_bindgroup(
+        device: &wgpu::Device,
+        bindgroup_layout: &wgpu::BindGroupLayout,
+        depth_view: &wgpu::TextureView,
+        s: &wgpu::Sampler,
+        lights: &Vec<Light>,
+    ) -> wgpu::BindGroup {
+        let all_lights_data: Vec<LightData> = lights.iter().map(|l| l.data).collect();
+        let all_lights_buffer = device.create_buffer_init(&BufferInitDescriptor {
+            label: Some("all light buffer"),
+            contents: bytemuck::cast_slice(&all_lights_data),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("shadow texture/view/lightdata bindgroup"),
+            layout: bindgroup_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: &all_lights_buffer,
+                        offset: 0,
+                        size: None,
+                    }),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&depth_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(s),
+                },
+            ],
+        })
+    }
+
+    pub fn draw_light(&self, encoder: &mut wgpu::CommandEncoder, light_ctx: &LightCtx) {
+        for i in 0..self.lights.len() {
+            let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some(&format!("renderpass LIGHT: {}", i)),
+                color_attachments: &[],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &light_ctx.light_views[i],
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+
+            let planes = self.lights[i].planes;
+            render_pass.set_pipeline(&light_ctx.light_pipeline);
+            let offset = i as u32 * 256;
+            render_pass.set_bind_group(0, &light_ctx.light_bg, &[offset]);
+            for mesh in &self.meshes {
+                render_pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
+                render_pass
+                    .set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                for p in &mesh.primitives {
+                    if planes.frustum_culling(p.min, p.max) || true {
+                        render_pass.set_bind_group(
+                            1,
+                            &mesh.bind_group_matrices,
+                            &[p.offset_buffer],
+                        );
+                        render_pass.draw_indexed(p.start..(p.start + p.count), 0, 0..1);
+                    }
+                }
+            }
+        }
+    }
 }
 
 fn get_model_matrix(
     node: &gltf::Node,
-    parent_matrix: &Matrix4<f32>,
+    parent_matrix: &Mat4,
     door_pos: &mut Vec<Vec3>,
     lock_pos: &mut Vec<Vec3>,
-    scales: &mut Vec<Vector3<f32>>,
+    scales: &mut Vec<Vec3>,
     mut id: &mut Option<u32>,
     is_door: &mut bool,
-) -> [[f32; 4]; 4] {
-    let m = match node.transform() {
-        gltf::scene::Transform::Matrix { matrix } => matrix,
+    door_ids: &mut HashMap<usize, usize>,
+    lock_ids: &mut HashMap<usize, usize>,
+) -> Mat4 {
+    let m: Mat4 = match node.transform() {
+        gltf::scene::Transform::Matrix { matrix } => bytemuck::cast(matrix),
         gltf::scene::Transform::Decomposed {
             translation,
             rotation,
@@ -63,8 +259,10 @@ fn get_model_matrix(
                     if let Ok(i) = &name[4..].parse::<u32>() {
                         *id_num = *i - 1;
                         door_pos.push(Vec3::new(translation[0], translation[1], translation[2]));
-                        scales.push(Vector3::new(scale[0], scale[1], scale[2]));
+                        scales.push(Vec3::new(scale[0], scale[1], scale[2]));
                         *is_door = true;
+                        door_ids.insert(*id_num as usize, door_pos.len() - 1);
+                        println!("DOOR: {door_pos:?}");
                     } else {
                         println!("{name} is have invalid id")
                     }
@@ -72,6 +270,8 @@ fn get_model_matrix(
                     if let Ok(i) = &name[5..].parse::<u32>() {
                         *id_num = *i - 1;
                         lock_pos.push(Vec3::new(translation[0], translation[1], translation[2]));
+                        lock_ids.insert(*id_num as usize, lock_pos.len() - 1);
+                        println!("LOCK: {lock_pos:?}");
                     } else {
                         println!("{name} is have invalid id")
                     }
@@ -79,41 +279,38 @@ fn get_model_matrix(
                     *id = None;
                 }
             };
-            let t: Matrix4<f32> = Matrix4::from_translation(Vector3::new(
-                translation[0],
-                translation[1],
-                translation[2],
-            ));
-            let r: Matrix4<f32> = Matrix4::from(Quaternion::new(
-                rotation[3],
+            let t: Mat4 =
+                Mat4::from_translation(Vec3::new(translation[0], translation[1], translation[2]));
+            let r: Mat4 = Mat4::from_quat(Quat::from_xyzw(
                 rotation[0],
                 rotation[1],
                 rotation[2],
+                rotation[3],
             ));
-            let s: Matrix4<f32> = Matrix4::from_nonuniform_scale(scale[0], scale[1], scale[2]);
+            let s: Mat4 = Mat4::from_scale(Vec3::new(scale[0], scale[1], scale[2]));
             let local_mt = t * r * s;
-            (parent_matrix * local_mt).into()
+            parent_matrix * local_mt
         }
     };
     m
 }
 
 fn convert_aabb_from_matrix(
-    min: Vector3<f32>,
-    max: Vector3<f32>,
-    matrix: Matrix4<f32>,
+    min: Vec3,
+    max: Vec3,
+    matrix: Mat4,
 ) -> ([f32; 3], [f32; 3], [f32; 3], [f32; 3]) {
     let old_extent = (max - min) * 0.5;
     let old_center = (min + max) * 0.5;
-    let center4 = matrix * Vector4::new(old_center.x, old_center.y, old_center.z, 1.0);
-    let center = Vector3::new(center4.x, center4.y, center4.z);
+    let center = (matrix * Vec4::new(old_center.x, old_center.y, old_center.z, 1.0)).xyz();
+    let (x, y, z) = (
+        matrix.x_axis.xyz().abs(),
+        matrix.y_axis.xyz().abs(),
+        matrix.z_axis.xyz().abs(),
+    );
 
-    let mut extent = Vector3::new(0.0, 0.0, 0.0);
-    for i in 0..3 {
-        for j in 0..3 {
-            extent[i] += matrix[j][i] * old_extent[i];
-        }
-    }
+    let extent = x * old_extent.x + y * old_extent.y + z * old_extent.z;
+
     let min = center - extent;
     let max = center + extent;
     (min.into(), max.into(), center.into(), extent.into())
@@ -132,11 +329,12 @@ fn read_node(
     mut textures: &mut Vec<meshes::Texture>,
     mut img_cache: &mut HashMap<usize, usize>,
     mut matrices: &mut Vec<meshes::ModelMatrix>,
-    parent_matrix: &Matrix4<f32>,
+    parent_matrix: &Mat4,
     mut door_pos: &mut Vec<Vec3>,
     mut lock_pos: &mut Vec<Vec3>,
-    mut scales: &mut Vec<Vector3<f32>>,
-    mut ids: &mut HashMap<usize, usize>,
+    mut scales: &mut Vec<Vec3>,
+    mut door_ids: &mut HashMap<usize, usize>,
+    mut lock_ids: &mut HashMap<usize, usize>,
     mut baked_tt: &mut Vec<meshes::BakedTexture>,
 ) {
     // door check
@@ -152,25 +350,31 @@ fn read_node(
         &mut scales,
         &mut id,
         &mut door,
+        &mut door_ids,
+        &mut lock_ids,
     );
-    if let Some(id) = id {
-        let len_ids = ids.len();
-        ids.entry(id as usize).or_insert_with(|| len_ids);
-    };
 
     if let Some(mesh) = node.mesh() {
         for primitive in mesh.primitives() {
             // min max
-            let accessor = primitive.get(&gltf::Semantic::Positions).unwrap();
-            let (mi, ma) = (accessor.min().unwrap(), accessor.max().unwrap());
+            let accessor = primitive
+                .get(&gltf::Semantic::Positions)
+                .expect("no accessor");
+            let (mi, ma) = (
+                accessor.min().expect("no min"),
+                accessor.max().expect("no max"),
+            );
             let min_raw: [f32; 3] = serde_json::from_value(mi.clone()).expect("cant extract min");
             let max_raw: [f32; 3] = serde_json::from_value(ma.clone()).expect("cant extract min");
             let (min, max, center, extent) =
-                convert_aabb_from_matrix(min_raw.into(), max_raw.into(), model_matrix.into());
+                convert_aabb_from_matrix(min_raw.into(), max_raw.into(), model_matrix);
 
             // texture
             let material = primitive.material();
-            let img_info = material.emissive_texture().expect("no info");
+            let Some(img_info) = material.emissive_texture() else {
+                println!("NO EMISSION");
+                return;
+            };
             let img_index = img_info.texture().source().index();
             let texture_id: usize = *img_cache.entry(img_index).or_insert_with(|| {
                 let img_data = &images[img_index];
@@ -192,6 +396,7 @@ fn read_node(
                         panic!("unsupported format texture image")
                     }
                 };
+                scene_helper::ram("before init bc7");
                 let format = Format::BC7_UNORM_BLOCK;
                 let encoder = Encoder::Bc7enc(Bc7encSettings::default());
                 let convert_settings = ConvertSettings {
@@ -218,12 +423,19 @@ fn read_node(
                     convert(image, convert_settings).expect("cant compress rgba to bc7unorm");
                 let bc7_data = match bc7_output {
                     PipelineOutput::Raw(mut compressed_image) => {
-                        compressed_image.surfaces.pop().unwrap().pop().unwrap().data
+                        compressed_image
+                            .surfaces
+                            .pop()
+                            .expect("cant pop first")
+                            .pop()
+                            .expect("cant pop second")
+                            .data
                     }
                     _ => {
                         panic!("failed compress")
                     }
                 };
+                println!("bc7 len in u8 vec: {}", bc7_data.len());
                 // wgpu tt process
                 let block_x = (img_data.width + 3) / 4 * 4;
                 let block_y = (img_data.height + 3) / 4 * 4;
@@ -260,6 +472,7 @@ fn read_node(
                     width: block_x,
                     height: block_y,
                 });
+                scene_helper::ram("after zip bc7");
                 let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
                 let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
                     address_mode_u: wgpu::AddressMode::Repeat,
@@ -312,7 +525,7 @@ fn read_node(
             let start = all_indices.len() as u32;
             let indices: Vec<u32> = reader
                 .read_indices()
-                .unwrap()
+                .expect("no indices")
                 .into_u32()
                 .map(|i| i + offset)
                 .collect();
@@ -356,11 +569,12 @@ fn read_node(
             &mut textures,
             &mut img_cache,
             &mut matrices,
-            &model_matrix.into(),
+            &model_matrix,
             &mut door_pos,
             &mut lock_pos,
             &mut scales,
-            &mut ids,
+            door_ids,
+            lock_ids,
             &mut baked_tt,
         );
     }
@@ -381,6 +595,31 @@ fn read_meta_primitive(
     }
 }
 
+pub fn flat_world_doors<'a>(meshes: &'a mut Vec<Meshes>) {
+    let mut offset_id = 0u32;
+
+    'mesh: for mesh in meshes {
+        if mesh.primitives.iter().any(|p| p.is_door.door) {
+            let doors_len = mesh.doors.len();
+            for p in &mut mesh.primitives {
+                if let Some(id) = &mut p.is_door.id {
+                    *id += offset_id;
+                }
+            }
+            let old_cap = mesh.doors.capacity();
+            let old_doors = std::mem::replace(&mut mesh.doors, HashMap::with_capacity(old_cap));
+            mesh.doors = old_doors
+                .into_iter()
+                .map(|(id, door)| (id + offset_id, door))
+                .collect();
+            println!("{:?}", mesh.doors);
+
+            offset_id += doors_len as u32;
+            continue 'mesh;
+        }
+    }
+}
+
 pub fn load_model(
     name: &str,
     device: &wgpu::Device,
@@ -389,8 +628,14 @@ pub fn load_model(
     model_matrix_layout: &wgpu::BindGroupLayout,
 ) -> Meshes {
     let reload_path = format!("./assets/baked_models/{}.model", name);
-    if let Ok(file_byte) = fs::read(&reload_path) {
-        let real_data = bincode::deserialize::<BakedMeshes>(&file_byte).expect("cant deserialize");
+    if let Ok(file) = File::open(&reload_path) {
+        device.on_uncaptured_error(Arc::new(|error| {
+            panic!("WGPU ERROR: {}", error);
+        }));
+
+        let mut decoder = zstd::Decoder::new(file).expect("cant create decoder");
+        let real_data: BakedMeshes =
+            bincode::deserialize_from(decoder.by_ref()).expect("cant deserialize");
         let vertex_buffer = device.create_buffer_init(&BufferInitDescriptor {
             label: Some("vx_buffer"),
             contents: bytemuck::cast_slice(&real_data.vertex),
@@ -532,12 +777,13 @@ pub fn load_model(
         let mut baked_texture: Vec<BakedTexture> = Vec::new();
         // model matrices
         let mut matrices: Vec<ModelMatrix> = Vec::with_capacity(nodes_count);
-        let default_mat = Matrix4::identity();
+        let default_mat = Mat4::IDENTITY;
         // door check
         let mut door_pos: Vec<Vec3> = Vec::new();
         let mut lock_pos: Vec<Vec3> = Vec::new();
-        let mut scales: Vec<Vector3<f32>> = Vec::new();
-        let mut ids: HashMap<usize, usize> = HashMap::new();
+        let mut scales: Vec<Vec3> = Vec::new();
+        let mut door_ids: HashMap<usize, usize> = HashMap::new();
+        let mut lock_ids: HashMap<usize, usize> = HashMap::new();
 
         for scene in document.scenes() {
             for node in scene.nodes() {
@@ -558,22 +804,26 @@ pub fn load_model(
                     &mut door_pos,
                     &mut lock_pos,
                     &mut scales,
-                    &mut ids,
+                    &mut door_ids,
+                    &mut lock_ids,
                     &mut baked_texture,
                 );
-                scene_helper::ram();
+                scene_helper::ram("read node");
             }
         }
+        scene_helper::ram("before vt buffer");
         let vertex_buffer = device.create_buffer_init(&BufferInitDescriptor {
             label: Some("vx_buffer"),
             contents: bytemuck::cast_slice(&all_verticles),
             usage: wgpu::BufferUsages::VERTEX,
         });
+        scene_helper::ram("after vt buffer/before index");
         let index_buffer = device.create_buffer_init(&BufferInitDescriptor {
             label: Some("ix_buffer"),
             contents: bytemuck::cast_slice(&all_indices),
             usage: wgpu::BufferUsages::INDEX,
         });
+        scene_helper::ram("after vt buffer/after index/before matrix");
         // model matrices
         let buffer_matrices = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("matrices buffer"),
@@ -594,50 +844,72 @@ pub fn load_model(
                 }),
             }],
         });
+        scene_helper::ram("after vt buffer/after index/after matrix/before door hashmap");
 
         let mut doors: HashMap<u32, Door> = HashMap::new();
-        println!("{:?}, ANDANDAND {:?}", lock_pos, door_pos);
+        println!("{:?}, AND_AND_AND {:?}", lock_pos, door_pos);
         if (lock_pos.len() == 0) || (door_pos.len() == 0) {
+            for p in &mut pris {
+                if p.is_door.door {
+                    p.is_door.door = false;
+                }
+            }
             ()
         } else {
-            for (id, index) in ids {
-                doors.entry(id as u32).or_insert_with(|| Door {
-                    lock_for_door: lock_pos[index] - door_pos[index],
-                    lock_pos: lock_pos[index],
-                    scale: scales[index],
-                });
+            for id in 0..lock_pos.len() {
+                if let Some(door_index) = door_ids.get(&id) {
+                    if let Some(lock_index) = lock_ids.get(&id) {
+                        doors.insert(
+                            id as u32,
+                            Door {
+                                lock_pos: lock_pos[*lock_index],
+                                lock_for_door: lock_pos[*lock_index] - door_pos[*door_index],
+                                scale: scales[*door_index],
+                            },
+                        );
+                        println!("{doors:?}");
+                    }
+                }
             }
         }
+        scene_helper::ram(
+            "after vt buffer/after index/after matrix/after door hashmap/ before init stream serd and zip zstd",
+        );
 
-        let ser_matrices = matrices
-            .iter()
-            .map(|m| m.matrix)
-            .collect::<Vec<[[f32; 4]; 4]>>();
-        let ser_doors: HashMap<u32, BakedDoor> = doors
+        let ser_matrices = matrices.iter().map(|m| m.matrix).collect::<Vec<Mat4>>();
+        let ser_doors: HashMap<u32, Door> = doors
             .iter()
             .map(|(k, d)| {
                 (
                     *k,
-                    BakedDoor {
-                        lock_for_door: d.lock_for_door.into(),
-                        lock_pos: d.lock_pos.into(),
-                        scale: d.scale.into(),
+                    Door {
+                        lock_for_door: d.lock_for_door,
+                        lock_pos: d.lock_pos,
+                        scale: d.scale,
                     },
                 )
             })
             .collect();
-        let serialized_data = bincode::serialize::<BakedMeshes>(&BakedMeshes {
-            vertex: all_verticles,
-            index: all_indices,
-            primitives: pris.clone(),
-            baked_texture,
-            matrices: ser_matrices,
-            doors: ser_doors,
-        })
+        let file = File::create(reload_path.as_str()).expect("cant create file");
+        let mut encoder = zstd::Encoder::new(file, 8).expect("cant create encoder");
+        scene_helper::ram("encoder");
+        bincode::serialize_into(
+            encoder.by_ref(),
+            &BakedMeshes {
+                vertex: all_verticles,
+                index: all_indices,
+                primitives: pris.clone(),
+                baked_texture,
+                matrices: ser_matrices,
+                doors: ser_doors,
+            },
+        )
         .expect("cant ser data");
-        fs::write(reload_path.as_str(), serialized_data).expect("can write file");
-
-        scene_helper::ram();
+        scene_helper::ram(
+            "after vt buffer/after index/after matrix/after door hashmap/ after init stream serd and zip zstd and before finish encoder of zstd",
+        );
+        encoder.finish().expect("cant finish");
+        scene_helper::ram("after it and finish 1 mesh");
         Meshes {
             vertex_buffer,
             index_buffer,

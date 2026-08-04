@@ -47,7 +47,6 @@ impl Audio {
 
     pub fn stop_slowly(&mut self, thread: &str, speed_fading: f32, dt: f32) {
         let Some((player, playing)) = self.active.get_mut(&thread.to_string()) else {
-            println!("KEY: {:?}", self.active.keys());
             return;
         };
         playing.is_playing = false;
@@ -63,7 +62,9 @@ impl Audio {
     pub fn play_again(&mut self, thread: &str, name: &str, speed: f32, volume: f32) {
         self.stop(thread);
         let volume = volume * self.volume / 100.0;
-        let bytes = self.cache.get(&name.to_string()).expect("no byte");
+        let Some(bytes) = self.cache.get(&name.to_string()) else {
+            return;
+        };
         let cursor = Cursor::new(Arc::from(bytes.clone()));
         let source = Decoder::new(cursor).expect("no decode");
         let player = Player::connect_new(self.device.mixer());

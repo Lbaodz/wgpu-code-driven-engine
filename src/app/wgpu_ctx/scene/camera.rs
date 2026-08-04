@@ -1,11 +1,13 @@
-use cgmath::{Point3, Vector3, Matrix4, Deg, InnerSpace, dot};
+use bytemuck::{Pod, Zeroable};
+use glam::{Mat4, Vec3};
 use pub_fields::pub_fields;
+use serde::{Deserialize, Serialize};
 
-#[pub_fields] 
+#[pub_fields]
 pub struct Camera {
-    eye: Point3<f32>,
-    target: Point3<f32>,
-    up: Vector3<f32>,
+    eye: Vec3,
+    target: Vec3,
+    up: Vec3,
     aspect: f32,
     fov: f32,
     near: f32,
@@ -14,32 +16,33 @@ pub struct Camera {
     pitch: f32,
     is_moving: bool,
     is_rotating: bool,
+    planes: Option<Planes>,
 }
 
-#[pub_fields] 
+#[pub_fields]
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct UniformCamera {
-    uniform: [[f32; 4]; 4],
+    uniform: Mat4,
 }
 
-
 impl Camera {
-    pub fn make_camera(&self) -> Matrix4<f32> {
-        let view = Matrix4::look_at_rh(self.eye, self.target, self.up);
-        let v_fov = 2.0 * ((self.fov.to_radians() / 2.0).tan() / self.aspect).atan();
-        let proj = cgmath::perspective(Deg(v_fov.to_degrees()), self.aspect, self.near, self.far);
-        let wgpu_matrix_correction = Matrix4::new(
-            1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.5, 0.5, 0.0, 0.0, 0.0, 1.0,
+    pub fn make_camera(&self) -> Mat4 {
+        let view = glam::camera::rh::view::look_at_mat4(self.eye, self.target, self.up);
+        let proj = glam::camera::rh::proj::directx::perspective_infinite_reverse(
+            self.fov.to_radians(),
+            self.aspect,
+            self.near,
         );
-        wgpu_matrix_correction * proj * view
+
+        proj * view
     }
 
-    pub fn update_target(&mut self) -> Vector3<f32> {
+    pub fn update_target(&mut self) -> Vec3 {
         let rad_yaw = self.yaw.to_radians();
         let rad_pitch = self.pitch.to_radians();
 
-        let new_vector = Vector3::new(
+        let new_vector = Vec3::new(
             rad_yaw.cos() * rad_pitch.cos(),
             rad_pitch.sin(),
             rad_yaw.sin() * rad_pitch.cos(),
@@ -47,25 +50,41 @@ impl Camera {
         self.target = self.eye + new_vector;
         new_vector
     }
+
+    pub fn update_planes(&mut self, value: Planes) {
+        if let Some(planes) = &mut self.planes {
+            *planes = value;
+        }
+    }
+
+    pub fn take_plane(&self) -> Planes {
+        if let Some(planes) = &self.planes {
+            *planes
+        } else {
+            Planes::build_plane_from_matrix4(self.make_camera())
+        }
+    }
 }
 
-#[pub_fields] 
-#[derive(Default)]
+#[pub_fields]
+#[derive(Debug, Default, Clone, Copy, Serialize, Deserialize)]
 struct Plane {
     normal: [f32; 3],
     d: f32,
 }
 
-#[pub_fields] 
+#[pub_fields]
+#[derive(Debug, Default, Clone, Copy, Serialize, Deserialize)]
 pub struct Planes {
     planes: [Plane; 6],
 }
 
 impl Planes {
-    pub fn build_plane_from_matrix4(matrix4: Matrix4<f32>) -> Self {
+    pub fn build_plane_from_matrix4(matrix4: Mat4) -> Self {
         let m = matrix4;
+        let (x, y, z, w) = (m.row(0), m.row(1), m.row(2), m.row(3));
         let make_plane = |nx, ny, nz, d| {
-            let length = Vector3::new(nx, ny, nz).magnitude();
+            let length = Vec3::new(nx, ny, nz).length();
             Plane {
                 normal: [nx / length, ny / length, nz / length],
                 d: d / length,
@@ -73,31 +92,141 @@ impl Planes {
         };
         Self {
             planes: [
-                make_plane(m.x.w + m.x.x, m.y.w + m.y.x, m.z.w + m.z.x, m.w.w + m.w.x),
-                make_plane(m.x.w - m.x.x, m.y.w - m.y.x, m.z.w - m.z.x, m.w.w - m.w.x),
-                make_plane(m.x.w + m.x.y, m.y.w + m.y.y, m.z.w + m.z.y, m.w.w + m.w.y),
-                make_plane(m.x.w - m.x.y, m.y.w - m.y.y, m.z.w - m.z.y, m.w.w - m.w.y),
-                make_plane(m.x.w + m.x.z, m.y.w + m.y.z, m.z.w + m.z.z, m.w.w + m.w.z),
-                make_plane(m.x.w - m.x.z, m.y.w - m.y.z, m.z.w - m.z.z, m.w.w - m.w.z),
+                make_plane(w.x + x.x, w.y + x.y, w.z + x.z, w.w + x.w),
+                make_plane(w.x - x.x, w.y - x.y, w.z - x.z, w.w - x.w),
+                make_plane(w.x + y.x, w.y + y.y, w.z + y.z, w.w + y.w),
+                make_plane(w.x - y.x, w.y - y.y, w.z - y.z, w.w - y.w),
+                make_plane(z.x, z.y, z.z, z.w),
+                make_plane(w.x - z.x, w.y - z.y, w.z - z.z, w.w - z.w),
             ],
         }
     }
 
     pub fn frustum_culling(&self, min: [f32; 3], max: [f32; 3]) -> bool {
+        let box_min = Vec3::from_array(min);
+        let box_max = Vec3::from_array(max);
         for plane in &self.planes {
-            let mut positive_normal: [f32; 3] = [0.0; 3];
-            let normal = plane.normal;
-            for i in 0..3 {
-                if normal[i] >= 0.0 {
-                    positive_normal[i] = max[i];
-                } else {
-                    positive_normal[i] = min[i];
-                }
-            }
-            if dot::<Vector3<f32>>(normal.into(), positive_normal.into()) + plane.d < 0.0 {
+            let normal = Vec3::from_array(plane.normal);
+            let is_positive = Vec3::ZERO.cmple(normal);
+
+            let positive_normal = Vec3::select(is_positive, box_max, box_min);
+
+            if normal.dot(positive_normal) + plane.d < 0.0 {
                 return false;
             }
         }
         true
     }
+}
+
+#[pub_fields]
+pub struct LightCtx {
+    light_bg: wgpu::BindGroup,
+    light_views: Vec<wgpu::TextureView>,
+    depth_view: wgpu::TextureView,
+    shadow_bg: wgpu::BindGroup,
+    light_pipeline: wgpu::RenderPipeline,
+}
+
+impl LightCtx {
+    pub fn new(
+        light_bg: wgpu::BindGroup,
+        light_views: Vec<wgpu::TextureView>,
+        shadow_bg: wgpu::BindGroup,
+        depth_view: wgpu::TextureView,
+        light_pipeline: wgpu::RenderPipeline,
+    ) -> Self {
+        Self {
+            light_bg,
+            light_views,
+            shadow_bg,
+            depth_view,
+            light_pipeline,
+        }
+    }
+}
+
+#[pub_fields]
+#[repr(C)]
+#[derive(Debug, Default, Clone, Copy, Pod, Zeroable, Serialize, Deserialize)]
+pub struct LightData {
+    light_matrices: Mat4,
+    color: [f32; 4],
+    dir: [f32; 4],
+}
+
+#[pub_fields]
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct LightDataAlign {
+    data: LightData,
+    _pad: [u32; 40],
+}
+
+#[pub_fields]
+#[derive(Debug, Default, Clone, Copy, Serialize, Deserialize)]
+pub struct Light {
+    data: LightData,
+    planes: Planes,
+}
+
+impl Light {
+    pub fn new_light(
+        pos: Vec3,
+        dir: Vec3,
+        left: f32,
+        right: f32,
+        top: f32,
+        bottom: f32,
+        near: f32,
+        far: f32,
+        density: f32,
+        color: [f32; 4],
+    ) -> Self {
+        let dir_n = dir.normalize();
+        let matrix = make_light_matrix(pos, &dir_n, left, right, top, bottom, near, far);
+        Self {
+            data: LightData {
+                light_matrices: matrix,
+                dir: [dir_n.x, dir_n.y, dir_n.z, density],
+                color,
+            },
+            planes: Planes::build_plane_from_matrix4(matrix),
+        }
+    }
+}
+
+// helper
+fn make_light_matrix(
+    pos: Vec3,
+    dir: &Vec3,
+    left: f32,
+    right: f32,
+    top: f32,
+    bottom: f32,
+    near: f32,
+    far: f32,
+) -> Mat4 {
+    let target = pos + dir;
+    let mut up = Vec3::Y;
+    if dir.y.abs() >= 0.99 {
+        up = Vec3::Z;
+    }
+    let view = glam::camera::rh::view::look_at_mat4(pos, target, up);
+    let p = glam::camera::rh::proj::directx::orthographic(left, right, bottom, top, near, far);
+    p * view
+}
+
+#[macro_export]
+macro_rules! p3 {
+    ($x:expr, $y:expr, $z:expr $(,)?) => {
+        Vec3::new($x, $y, $z)
+    };
+}
+
+#[macro_export]
+macro_rules! v3 {
+    ($x:expr, $y:expr, $z:expr $(,)?) => {
+        Vec3::new($x, $y, $z)
+    };
 }
