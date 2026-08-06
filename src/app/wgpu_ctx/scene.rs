@@ -3,6 +3,7 @@ pub mod camera;
 pub mod meshes;
 use crate::app::wgpu_ctx::scene::camera::{LightData, LightDataAlign};
 use crate::app::wgpu_ctx::scene::meshes::collision::DoorAndJoint;
+use bytemuck::{Pod, Zeroable};
 use camera::{Light, LightCtx};
 use ctt::encoders::bc7enc::Bc7encSettings;
 use ctt::{ConvertSettings, Format, convert, encoders::Encoder};
@@ -14,7 +15,7 @@ use meshes::{
 use pub_fields::pub_fields;
 use rapier3d::{
     control::KinematicCharacterController,
-    dynamics::{ImpulseJointHandle, ImpulseJointSet, RigidBodyHandle, RigidBodySet},
+    dynamics::{ImpulseJointSet, RigidBodyHandle, RigidBodySet},
     geometry::ColliderSet,
     math::Vec3,
 };
@@ -23,16 +24,25 @@ use std::fs::File;
 use std::io::{Read, Write};
 use std::sync::Arc;
 use std::sync::mpsc::Receiver;
-use wgpu::RenderPipeline;
 use wgpu::TextureUsages;
 use wgpu::util::{BufferInitDescriptor, DeviceExt};
+use wgpu::{ComputePipeline, RenderPipeline};
 pub mod scene_helper;
+
+#[pub_fields]
+#[repr(C)]
+#[derive(Debug, Default, Pod, Zeroable, Clone, Copy)]
+pub struct CacheLights {
+    lights_count: u32,
+    lights_in_tile: [u32; 15],
+}
 
 #[pub_fields]
 pub struct AllPipeline {
     render_pipeline: RenderPipeline,
     transparency_pipeline: RenderPipeline,
     early_depth_pipeline: RenderPipeline,
+    compute_pipeline: ComputePipeline,
 }
 
 #[pub_fields]
@@ -66,11 +76,118 @@ pub struct Scene {
     meshes: Vec<Meshes>,
     transparency_meshes: Vec<Meshes>,
     lights: Vec<Light>,
+    light_first_loaded: bool,
     rr: Receiver<ResultSent>,
     loaded: bool,
 }
 
 impl Scene {
+    pub fn create_all_shadow_buffer(
+        device: &wgpu::Device,
+        config: &wgpu::SurfaceConfiguration,
+        lights: &Vec<Light>,
+    ) -> (wgpu::Buffer, wgpu::Buffer)
+     {
+        let lights_data: Vec<LightData> = lights.iter()
+        .map(|l|
+            l.data
+        ).collect();
+        let cache_buffer = Scene::create_cache_light_buffer(device, config);
+        let data_buffer = device.create_buffer_init(&BufferInitDescriptor {
+            label: Some("light data buffer"),
+            contents: bytemuck::cast_slice(&lights_data),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+        (data_buffer, cache_buffer)
+    }
+
+    fn create_cache_light_buffer(
+        device: &wgpu::Device,
+        config: &wgpu::SurfaceConfiguration,
+    ) -> wgpu::Buffer {
+        let x_tiles = (config.width + 15) / 16;
+        let y_tiles = (config.height + 15) / 16;
+        let total_tiles = (x_tiles * y_tiles) as usize;
+        let mut cache_lights: Vec<CacheLights> = Vec::with_capacity(total_tiles);
+        cache_lights.push(CacheLights::default());
+        println!("{cache_lights:?}");
+        device.create_buffer_init(&BufferInitDescriptor {
+            label: Some("light cache buffer"),
+            contents: bytemuck::cast_slice(&cache_lights),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        })
+    }
+
+    fn create_light_compute_bg(
+        device: &wgpu::Device,
+        all_lights_buffer: &wgpu::Buffer,
+        lights_cache_buffer: &wgpu::Buffer,
+    ) -> (wgpu::BindGroup, wgpu::BindGroupLayout) {
+        let comp_bg_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("light cache comp bg layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+        (
+            device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("light cache comp bg"),
+                layout: &comp_bg_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                            buffer: all_lights_buffer,
+                            offset: 0,
+                            size: None,
+                        }),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                            buffer: lights_cache_buffer,
+                            offset: 0,
+                            size: None,
+                        }),
+                    },
+                ],
+            }),
+            comp_bg_layout,
+        )
+    }
+
+    pub fn create_cache_light_bg(
+        device: &wgpu::Device,
+        all_lights_buffer: &wgpu::Buffer,
+        lights_cache_buffer: &wgpu::Buffer
+    ) -> (
+        wgpu::BindGroup,
+        wgpu::BindGroupLayout,
+    ) {
+        let (c_bg, c_bg_layout) =
+            Scene::create_light_compute_bg(device, all_lights_buffer, &lights_cache_buffer);
+        (c_bg, c_bg_layout)
+    }
+
     pub fn create_shadow_tt(
         device: &wgpu::Device,
         res_x: u32,
@@ -119,7 +236,7 @@ impl Scene {
             address_mode_u: wgpu::AddressMode::ClampToEdge,
             address_mode_v: wgpu::AddressMode::ClampToEdge,
             address_mode_w: wgpu::AddressMode::ClampToEdge,
-            compare: Some(wgpu::CompareFunction::Less),
+            compare: Some(wgpu::CompareFunction::GreaterEqual),
             min_filter: wgpu::FilterMode::Linear,
             mag_filter: wgpu::FilterMode::Linear,
             ..Default::default()
@@ -136,7 +253,7 @@ impl Scene {
             .iter()
             .map(|l| LightDataAlign {
                 data: l.data,
-                _pad: [0; 40],
+                _pad: [0; 36],
             })
             .collect();
         let light_buffer = device.create_buffer_init(&BufferInitDescriptor {
@@ -160,42 +277,90 @@ impl Scene {
 
     pub fn create_shadow_bindgroup(
         device: &wgpu::Device,
-        bindgroup_layout: &wgpu::BindGroupLayout,
         depth_view: &wgpu::TextureView,
         s: &wgpu::Sampler,
-        lights: &Vec<Light>,
-    ) -> wgpu::BindGroup {
-        let all_lights_data: Vec<LightData> = lights.iter().map(|l| l.data).collect();
-        let all_lights_buffer = device.create_buffer_init(&BufferInitDescriptor {
-            label: Some("all light buffer"),
-            contents: bytemuck::cast_slice(&all_lights_data),
-            usage: wgpu::BufferUsages::STORAGE,
-        });
-        device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("shadow texture/view/lightdata bindgroup"),
-            layout: bindgroup_layout,
+        all_lights_buffer: &wgpu::Buffer,
+        lights_cache_buffer: &wgpu::Buffer,
+    ) -> (wgpu::BindGroup, wgpu::BindGroupLayout) {
+        let shadow_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("shadow_bg_layout"),
             entries: &[
-                wgpu::BindGroupEntry {
+                wgpu::BindGroupLayoutEntry {
                     binding: 0,
-                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                        buffer: &all_lights_buffer,
-                        offset: 0,
-                        size: None,
-                    }),
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
                 },
-                wgpu::BindGroupEntry {
+                wgpu::BindGroupLayoutEntry {
                     binding: 1,
-                    resource: wgpu::BindingResource::TextureView(&depth_view),
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Depth,
+                        view_dimension: wgpu::TextureViewDimension::D2Array,
+                        multisampled: false,
+                    },
+                    count: None,
                 },
-                wgpu::BindGroupEntry {
+                wgpu::BindGroupLayoutEntry {
                     binding: 2,
-                    resource: wgpu::BindingResource::Sampler(s),
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Comparison),
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
                 },
             ],
-        })
+        });
+
+        (
+            device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("shadow texture/view/lightdata bindgroup"),
+                layout: &shadow_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                            buffer: &all_lights_buffer,
+                            offset: 0,
+                            size: None,
+                        }),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(&depth_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::Sampler(s),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                            buffer: &lights_cache_buffer,
+                            offset: 0,
+                            size: None,
+                        }),
+                    }
+                ],
+            }),
+            shadow_layout,
+        )
     }
 
-    pub fn draw_light(&self, encoder: &mut wgpu::CommandEncoder, light_ctx: &LightCtx) {
+    pub fn draw_light(&mut self, encoder: &mut wgpu::CommandEncoder, light_ctx: &LightCtx) {
+        self.light_first_loaded = true;
         for i in 0..self.lights.len() {
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some(&format!("renderpass LIGHT: {}", i)),
@@ -203,7 +368,7 @@ impl Scene {
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                     view: &light_ctx.light_views[i],
                     depth_ops: Some(wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(1.0),
+                        load: wgpu::LoadOp::Clear(0.0),
                         store: wgpu::StoreOp::Store,
                     }),
                     stencil_ops: None,
@@ -217,12 +382,12 @@ impl Scene {
             render_pass.set_pipeline(&light_ctx.light_pipeline);
             let offset = i as u32 * 256;
             render_pass.set_bind_group(0, &light_ctx.light_bg, &[offset]);
-            for mesh in &self.meshes {
+            for mesh in &mut self.meshes {
                 render_pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
                 render_pass
                     .set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-                for p in &mesh.primitives {
-                    if planes.frustum_culling(p.min, p.max) || true {
+                for p in &mut mesh.primitives {
+                    if planes.frustum_culling(p.min, p.max) {
                         render_pass.set_bind_group(
                             1,
                             &mesh.bind_group_matrices,
@@ -232,6 +397,12 @@ impl Scene {
                     }
                 }
             }
+        }
+    }
+
+    pub fn align_light_ids(lights: &mut Vec<Light>) {
+        for (id, light) in lights.iter_mut().enumerate() {
+            light.data.id[0] = id as f32;
         }
     }
 }

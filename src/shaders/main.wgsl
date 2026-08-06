@@ -2,6 +2,12 @@ struct LightData {
     matrix: mat4x4f,
     color: vec4f,
     dir: vec4f,
+    id: vec4u,
+}
+
+struct CacheLight {
+    lights_count: u32,
+    lights_in_tile: array<u32, 15>,
 }
 
 @group(0) @binding(0)
@@ -19,6 +25,8 @@ var<storage, read> all_lights: array<LightData>;
 var all_tt: texture_depth_2d_array;
 @group(3) @binding(2)
 var sample: sampler_comparison;
+@group(3) @binding(3)
+var<storage, read> cache_lights: array<CacheLight>;
 
 struct VxIn {
     @location(0) pos: vec3f,
@@ -114,26 +122,19 @@ fn fs_transparency_main(in: FragOut) -> @location(0) vec4f {
     let ambient_light = vec3f(0.4);
     let shadow_factor = calculate_shadow_transparency(in);
     let final_shadow = ambient_light + shadow_factor;
+    let alpha = 0.75;
+    let tt_color = textureSample(t, s, in.uv);
+    let final_color = tt_color.rgb * final_shadow;
     //return vec4f(l_uv.x, l_uv.y, d, 1.0);
     //return vec4f(1.0, 0.0, 0.0, 0.6);
-    return textureSample(t, s, in.uv) * vec4f(final_shadow, 0.75);
+    return vec4f(final_color * alpha, alpha);
     /*let tt = textureSample(t, s, in.uv);
     return vec4<f32>(sin(tt.x + in.pos.x) * cos(in.camera.x),
     sin(tt.y + in.pos.y) * sin(in.camera.y),
     sin(tt.x + tt.y * in.pos.z) * cos(in.camera.x), 1.0); */
 };
 
-const POISSON_DISK = array<vec2f, 8>(
-    vec2f(-0.94201624, -0.39906216),
-    vec2f(0.94558609, -0.76890725),
-    vec2f(-0.094184101, -0.92938870),
-    vec2f(0.34495938, 0.29387760),
-    vec2f(-0.91588581, 0.45771432),
-    vec2f(-0.33651259, 0.75893221),
-    vec2f(0.35951867, -0.21198902),
-    vec2f(0.79115914, 0.19090169)
-);
-
+const BIAS = 0.9995;
 fn calculate_shadow_transparency(in: FragOut) -> vec3f {
     let normal = in.normal;
     var shadow_factor = vec3f(0.0);
@@ -162,9 +163,12 @@ fn calculate_shadow_transparency(in: FragOut) -> vec3f {
             d < 0.0 || d > 1.0) {
             continue;
         }
-        let base_bias = 0.005;
+        let center = vec2f(0.5);
+        let dist = distance(light_uv, center);
+        if (dist > 0.5) { continue; }
+
         let light_visibility = textureSampleCompare(
-            all_tt, sample, light_uv, i, d - base_bias
+            all_tt, sample, light_uv, i, d
         );
 
         shadow_factor += light_density * light_visibility * light_color * dot_val;
@@ -175,15 +179,13 @@ fn calculate_shadow_transparency(in: FragOut) -> vec3f {
 
 fn calculate_shadow(in: FragOut) -> vec3f {
     let normal = in.normal;
-    var shadow_factor = vec3f(0.0);
-    let inv_tex_size = vec2f(1.0) / vec2f(1024.0);
-    
-    let num_lights = arrayLength(&all_lights); 
+    var shadow_factor = vec3f(0.0); 
+    let num_lights = arrayLength(&all_lights);
 
     for (var i: u32 = 0u; i < num_lights; i = i + 1u) {
         let light = all_lights[i];
-        let dir = light.dir.xyz;
-        let dot_val = dot(-dir, normal);
+        let l_dir = -light.dir.xyz;
+        let dot_val = dot(l_dir, normal);
         let light_density = light.dir.w;
         let light_color = light.color.xyz;
 
@@ -195,23 +197,21 @@ fn calculate_shadow(in: FragOut) -> vec3f {
         let d = proj_light_view.z;
 
         if (light_uv.x < 0.0 || light_uv.x > 1.0 || light_uv.y < 0.0 || light_uv.y > 1.0 || d < 0.0 || d > 1.0) { continue; }
+        let center = vec2f(0.5);
+        let dist = distance(light_uv, center);
+        if (dist > 0.5) { continue; }
+        
+        /*
+        var total_specular = 0.0;
+        let shininess = 500.0;
+        let cam_view = vec3f(0.0, 0.0, 1.0);
+        let half_view = normalize(l_dir + cam_view);
+        let spec_dot = dot(half_view, normal);
+        total_specular += max(pow(spec_dot, shininess), 0.0);
+        */
 
-        let base_bias = 0.005;
+        let visibility = textureSampleCompare(all_tt, sample, light_uv, i, d);
         
-        let filter_scale = inv_tex_size; 
-
-        var visibility = 0.0;
-        
-        visibility += textureSampleCompare(all_tt, sample, light_uv, i, d - base_bias);
-         /*visibility += textureSampleCompare(all_tt, sample, light_uv + POISSON_DISK[1] * filter_scale, i, d - base_bias);
-        visibility += textureSampleCompare(all_tt, sample, light_uv + POISSON_DISK[2] * filter_scale, i, d - base_bias);
-        visibility += textureSampleCompare(all_tt, sample, light_uv + POISSON_DISK[3] * filter_scale, i, d - base_bias);
-        visibility += textureSampleCompare(all_tt, sample, light_uv + POISSON_DISK[4] * filter_scale, i, d - base_bias);
-        visibility += textureSampleCompare(all_tt, sample, light_uv + POISSON_DISK[5] * filter_scale, i, d - base_bias);
-        visibility += textureSampleCompare(all_tt, sample, light_uv + POISSON_DISK[6] * filter_scale, i, d - base_bias);
-        visibility += textureSampleCompare(all_tt, sample, light_uv + POISSON_DISK[7] * filter_scale, i, d - base_bias);*/
-        
-        visibility /= 1.0;
         shadow_factor += light_density * visibility * light_color * dot_val;
     }
     return shadow_factor;

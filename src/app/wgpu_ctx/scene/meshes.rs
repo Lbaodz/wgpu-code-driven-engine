@@ -153,14 +153,14 @@ impl collision::Collision {
         Vec3::new(new_pos.x, new_pos.y + 2.25, new_pos.z)
     }
 
-    pub fn need_update_door(&mut self) -> bool {
+    pub fn need_update_door(&self) -> bool {
         let mut should_check: Vec<bool> = Vec::new();
         let mut not_closed: bool = false;
-        for i in 0..self.door_joint_handles.len() {
+        for (_, door_joint) in &self.door_joint_handles {
             let joint = &self
                 .impulse_joint
-                .get_mut(self.door_joint_handles.get(&(i as u32)).expect("no door from id").joint_handle, false)
-                .expect("no joint handle");
+                .get(door_joint.joint_handle)
+                .expect("cant get joint from handle");
             let door = &self.rbs[joint.body2()];
             let door_rot = door.rotation();
             let angle = door_rot.to_euler(rapier3d::glamx::EulerRot::XYZ);
@@ -172,51 +172,55 @@ impl collision::Collision {
         should_check.into_iter().any(|s| s) || not_closed
     }
 
-    pub fn update_door(&mut self, forward: &Vec3) {
-        for i in 0..self.door_joint_handles.len() {
-            let joint = &mut self
-                .impulse_joint
-                .get_mut(self.door_joint_handles.get(&(i as u32)).expect("no door from id").joint_handle, false)
-                .expect("no joint handle");
-            let door = &mut self.rbs[joint.body2()];
-            let door_rot = door.rotation();
-            let angle = door_rot.to_euler(rapier3d::glamx::EulerRot::XYZ);
-            let curr_angle = angle.1;
-            let data = &mut joint.data;
-            let angvel_y = door.angvel().y;
-            let curr_angle_abs = curr_angle.abs();
+    pub fn update_door(&mut self, forward: &Vec3, id: u32) {
+        let joint = &mut self
+            .impulse_joint
+            .get_mut(
+                self.door_joint_handles
+                    .get(&id)
+                    .expect("no door from id")
+                    .joint_handle,
+                false,
+            )
+            .expect("no joint handle");
+        let door = &mut self.rbs[joint.body2()];
+        let door_rot = door.rotation();
+        let angle = door_rot.to_euler(rapier3d::glamx::EulerRot::XYZ);
+        let curr_angle = angle.1;
+        let data = &mut joint.data;
+        let angvel_y = door.angvel().y;
+        let curr_angle_abs = curr_angle.abs();
 
-            let door_forw = door_rot * Vec3::X;
-            let dot = Vec3::new(door_forw.x, door_forw.y, door_forw.z).dot(*forward) * 0.5 + 0.5;
-            let pos = dot < 0.5 || (angvel_y > 0.5 && angvel_y < 2.0);
-            let neg = dot > 0.5 || (angvel_y < -0.5 && angvel_y > -2.0);
+        let door_forw = door_rot * Vec3::X;
+        let dot = Vec3::new(door_forw.x, door_forw.y, door_forw.z).dot(*forward) * 0.5 + 0.5;
+        let pos = dot < 0.5 || (angvel_y > 0.5 && angvel_y < 2.0);
+        let neg = dot > 0.5 || (angvel_y < -0.5 && angvel_y > -2.0);
 
-            // when closed + no force or force
-            if curr_angle_abs < 0.0001 {
-                if pos {
-                    data.set_limits(rapier3d::dynamics::JointAxis::AngX, [0.0, FRAC_PI_2]);
-                    door.wake_up(true);
-                    println!("pos: {angvel_y}");
-                } else if neg {
-                    data.set_limits(rapier3d::dynamics::JointAxis::AngX, [-FRAC_PI_2, 0.0]);
-                    door.wake_up(true);
-                    println!("neg: {angvel_y}");
-                } else {
-                    data.set_limits(rapier3d::dynamics::JointAxis::AngX, [-0.005, 0.005]);
-                    println!("neither: {angvel_y}");
-                }
+        // when closed + no force or force
+        if curr_angle_abs < 0.0001 {
+            if pos {
+                data.set_limits(rapier3d::dynamics::JointAxis::AngX, [0.0, FRAC_PI_2]);
+                door.wake_up(true);
+                println!("pos: {angvel_y}");
+            } else if neg {
+                data.set_limits(rapier3d::dynamics::JointAxis::AngX, [-FRAC_PI_2, 0.0]);
+                door.wake_up(true);
+                println!("neg: {angvel_y}");
             } else {
-                if door.is_sleeping() && (pos || neg) {
-                    door.wake_up(true);
-                }
+                data.set_limits(rapier3d::dynamics::JointAxis::AngX, [-0.005, 0.005]);
+                println!("neither: {angvel_y}");
+            }
+        } else {
+            if door.is_sleeping() && (pos || neg) {
+                door.wake_up(true);
             }
         }
     }
 
     pub fn new_door_min_max(&self, id: u128) -> ([f32; 3], [f32; 3]) {
         let mut min_max: ([f32; 3], [f32; 3]) = ([0.0; 3], [0.0; 3]);
-        for i in 0..self.door_joint_handles.len() {
-            let rb = &self.rbs[self.door_joint_handles.get(&(i as u32)).expect("no door from id").door_handle];
+        for (_, door_joint) in &self.door_joint_handles {
+            let rb = &self.rbs[door_joint.door_handle];
             let col_handle = self.cs.get(rb.colliders()[0]).expect("no collider door");
             if col_handle.user_data == id {
                 let aabb = col_handle.compute_aabb();
@@ -235,17 +239,18 @@ impl collision::Collision {
         queue: &wgpu::Queue,
         buffer: &wgpu::Buffer,
     ) {
-        if self.need_update_matrix_door(id) {
-            let door = &mut self.rbs[self.door_joint_handles.get(&id).expect("no door from id").door_handle];
+        if let Some(door_handle) = self.need_update_matrix_door(id) {
+            let door = self.rbs.get_mut(door_handle).expect("no door from handle");
             door.wake_up(true);
             let door_pos = door.position();
             let translation = door_pos.translation;
             let rot = door_pos.rotation;
             let sca = doors.get(&id).expect(&id.to_string()).scale;
-            let t = Mat4::from_translation(Vec3::new(translation.x, translation.y, translation.z));
-            let r = Mat4::from_quat(Quat::from_xyzw(rot.x, rot.y, rot.z, rot.w));
-            let s = Mat4::from_scale(Vec3::new(sca.x, sca.y, sca.z));
-            let model_matrix = t * r * s;
+            let model_matrix = Mat4::from_scale_rotation_translation(
+                Vec3::new(sca.x, sca.y, sca.z),
+                Quat::from_xyzw(rot.x, rot.y, rot.z, rot.w),
+                Vec3::new(translation.x, translation.y, translation.z),
+            );
 
             queue.write_buffer(
                 buffer,
@@ -255,12 +260,16 @@ impl collision::Collision {
         }
     }
 
-    fn need_update_matrix_door(&self, id: u32) -> bool {
-        let door_rb_handle = self.door_joint_handles.get(&id).expect("no door from id").door_handle; // loaded indexed by file parser
+    fn need_update_matrix_door(&self, id: u32) -> Option<RigidBodyHandle> {
+        let door_rb_handle = self
+            .door_joint_handles
+            .get(&id)
+            .expect("no door from id")
+            .door_handle; // loaded indexed by file parser
         let char_rb_handle = self.char_handle;
 
-        if let (Some(door_rb), Some(char_rb)) =
-            (self.rbs.get(door_rb_handle), self.rbs.get(char_rb_handle))
+        if let (Some(char_rb), Some(door_rb)) =
+            (self.rbs.get(char_rb_handle), self.rbs.get(door_rb_handle))
         {
             if let (Some(&door_col), Some(&char_col)) =
                 (door_rb.colliders().first(), char_rb.colliders().first())
@@ -274,23 +283,23 @@ impl collision::Collision {
                     .abs()
                     > 0.01;
                 return if y_vel || y {
-                    true
+                    Some(door_rb_handle)
                 } else if let Some(contact_pair) =
                     self.narrow_phase.contact_pair(door_col, char_col)
                 {
                     if contact_pair.has_any_active_contact() {
-                        true
+                        Some(door_rb_handle)
                     } else {
-                        false
+                        None
                     }
                 } else {
-                    false
+                    None
                 };
             } else {
-                false
+                None
             }
         } else {
-            false
+            None
         }
     }
 }

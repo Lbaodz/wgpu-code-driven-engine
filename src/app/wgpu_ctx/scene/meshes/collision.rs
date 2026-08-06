@@ -43,7 +43,7 @@ pub struct Collision {
 impl Collision {
     pub fn update_physics(&mut self, dt: f32) {
         self.last_time += dt;
-        println!("{}", self.last_time);
+
         while self.last_time > PHYSICS_RATE {
             self.physics_pipeline.step(
                 self.gravity,
@@ -60,7 +60,6 @@ impl Collision {
                 &(),
             );
             self.last_time -= PHYSICS_RATE;
-        };
-        println!("last: {}", self.last_time);
+        }
     }
 }

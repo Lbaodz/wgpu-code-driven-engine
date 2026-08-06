@@ -7,6 +7,7 @@ use std::sync::mpsc::channel;
 use std::thread;
 use std::time::{Duration, Instant};
 use std::vec;
+use wgpu::Features;
 use wgpu_ctx::game_manager::{FileManager, GameLevel, GameState, InputState, PerformanceState};
 use wgpu_ctx::scene::camera::Light;
 use wgpu_ctx::scene::scene_helper;
@@ -20,6 +21,8 @@ use winit::event::{KeyEvent, WindowEvent};
 use winit::event_loop::ActiveEventLoop;
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{CursorGrabMode, Fullscreen, Window, WindowId};
+
+use crate::app::wgpu_ctx::WgpuCtx;
 
 #[derive(Default)]
 pub struct MyApp {
@@ -83,7 +86,8 @@ impl ApplicationHandler for MyApp {
             let (device, queue) = adap
                 .request_device(&wgpu::DeviceDescriptor {
                     label: Some("Device vs queue"),
-                    required_features: wgpu::Features::TEXTURE_COMPRESSION_BC,
+                    required_features: Features::TEXTURE_COMPRESSION_BC
+                        | Features::VERTEX_WRITABLE_STORAGE,
                     required_limits: wgpu::Limits::defaults(),
                     experimental_features: wgpu::ExperimentalFeatures::default(),
                     memory_hints: wgpu::MemoryHints::default(),
@@ -126,7 +130,7 @@ impl ApplicationHandler for MyApp {
                 //"do",
                 //"do1",
                 //"ok",
-                //"door",
+                "door",
             ]
             .into_iter()
             .map(|s: &str| s.to_string())
@@ -150,6 +154,7 @@ impl ApplicationHandler for MyApp {
                 meshes: Vec::with_capacity(md_len),
                 transparency_meshes: Vec::with_capacity(tr_len),
                 lights: vec![Light::default()],
+                light_first_loaded: false,
                 rr,
                 loaded: false,
             };
@@ -346,7 +351,13 @@ impl ApplicationHandler for MyApp {
                                                 panic!("cant get render ctx");
                                             };
                                             let all_pipeline = &render_ctx.pipeline;
-                                            gpu.scene.draw_light(&mut encoder, &light_ctx);
+                                            // z light
+                                            if gpu.collision.need_update_door()
+                                                || !gpu.scene.light_first_loaded
+                                            {
+                                                gpu.scene.draw_light(&mut encoder, &light_ctx);
+                                            }
+                                            // early z
                                             {
                                                 let mut z_pass = wgpu_helper::early_z_pass(
                                                     &mut encoder,
@@ -366,30 +377,39 @@ impl ApplicationHandler for MyApp {
                                                     false,
                                                 );
                                             }
+                                            // compute pass
+                                            {
+                                                let mut c_pass =
+                                                    wgpu_helper::create_compute_pass(&mut encoder);
+                                                c_pass.set_pipeline(&all_pipeline.compute_pipeline);
+                                                c_pass.set_bind_group(
+                                                    0,
+                                                    &render_ctx.camera_bind_group,
+                                                    &[],
+                                                );
+                                                c_pass.set_bind_group(
+                                                    1,
+                                                    &light_ctx.compute_lights_bg,
+                                                    &[],
+                                                );
+                                                c_pass.dispatch_workgroups(16, 16, 1);
+                                            }
+                                            // opaque/transparency pass
                                             let mut render_pass = wgpu_helper::game_pass(
                                                 &mut encoder,
                                                 &view,
                                                 &gpu.depth_view,
                                             );
+                                            // opaque draw
                                             render_pass.set_pipeline(&all_pipeline.render_pipeline);
-                                            render_pass.set_bind_group(
-                                                0,
-                                                &render_ctx.camera_bind_group,
-                                                &[],
-                                            );
-                                            render_pass.set_bind_group(
-                                                3,
-                                                &light_ctx.shadow_bg,
-                                                &[],
-                                            );
+                                            WgpuCtx::bind_basic_bg(&mut render_pass, &render_ctx, &light_ctx);
                                             gpu.draw_meshes(
                                                 &gpu.scene.meshes,
                                                 &mut render_pass,
                                                 true,
                                             );
-
-                                            render_pass
-                                                .set_pipeline(&all_pipeline.transparency_pipeline);
+                                            // transparency draw
+                                            render_pass.set_pipeline(&all_pipeline.transparency_pipeline);
                                             gpu.draw_meshes(
                                                 &gpu.scene.transparency_meshes,
                                                 &mut render_pass,
@@ -572,14 +592,15 @@ impl ApplicationHandler for MyApp {
                         render_ctx.camera.is_moving = true;
                     }
 
+                    // let make primitve for DOOR CACHE
                     if collision.need_update_door() {
-                        collision.update_door(&velocity);
                         for mesh in &mut gpu.scene.meshes {
                             for primitive in &mut mesh.primitives {
                                 if primitive.is_door.door {
                                     let Some(id) = primitive.is_door.id else {
                                         panic!("no id door");
                                     };
+                                    collision.update_door(&velocity, id);
                                     let (min, max) = collision.new_door_min_max(id as u128);
                                     primitive.min = min;
                                     primitive.max = max;

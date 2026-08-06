@@ -1,4 +1,4 @@
-use wgpu::{CommandEncoder, RenderPass, TextureView};
+use wgpu::{CommandEncoder, ComputePass, RenderPass, TextureView};
 
 pub fn game_pass<'a>(
     encoder: &'a mut CommandEncoder,
@@ -45,7 +45,7 @@ pub fn early_z_pass<'a>(
         depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
             view: depth_view,
             depth_ops: Some(wgpu::Operations {
-                load: wgpu::LoadOp::Clear(0.0),
+                load: wgpu::LoadOp::Clear(0.0), // reserve Z
                 store: wgpu::StoreOp::Store,
             }),
             stencil_ops: None,
@@ -67,12 +67,6 @@ pub fn menu_pass<'a>(
             resolve_target: None,
             ops: wgpu::Operations {
                 load: wgpu::LoadOp::DontCare(wgpu::LoadOpDontCare::default()),
-                /* ::Clear(wgpu::Color {
-                    r: 0.03,
-                    g: 0.03,
-                    b: 0.03,
-                    a: 1.0,
-                }), */
                 store: wgpu::StoreOp::Store, // STORE
             },
         })],
@@ -105,19 +99,6 @@ pub fn make_depth_tt(device: &wgpu::Device, config: &wgpu::SurfaceConfiguration)
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
         view_formats: &[wgpu::TextureFormat::Depth32Float],
     })
-}
-
-#[macro_export]
-macro_rules! create_pp_layout {
-    ($device:expr, [$($layout:expr),* $(,)?]) => {
-        $device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("pipeline layout"),
-            bind_group_layouts: &[
-                $(Some($layout)),*
-            ],
-            ..Default::default()
-        })
-    };
 }
 
 pub fn create_basic_pipeline(
@@ -264,9 +245,13 @@ pub fn create_light_pipeline(
         depth_stencil: Some(wgpu::DepthStencilState {
             format: wgpu::TextureFormat::Depth32Float,
             depth_write_enabled: Some(true),
-            depth_compare: Some(wgpu::CompareFunction::Less),
+            depth_compare: Some(wgpu::CompareFunction::GreaterEqual),
             stencil: wgpu::StencilState::default(),
-            bias: wgpu::DepthBiasState::default(),
+            bias: wgpu::DepthBiasState {
+                constant: -1,
+                slope_scale: -1.0,
+                clamp: 0.0,
+            },
         }),
         multisample: wgpu::MultisampleState::default(),
         multiview_mask: None,
@@ -315,36 +300,38 @@ pub fn create_early_depth_pipeline(
     })
 }
 
-pub fn create_shadow_bg_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
-    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label: Some("shadow_bg_layout"),
-        entries: &[
-            wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Storage { read_only: true },
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            },
-            wgpu::BindGroupLayoutEntry {
-                binding: 1,
-                visibility: wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Texture {
-                    sample_type: wgpu::TextureSampleType::Depth,
-                    view_dimension: wgpu::TextureViewDimension::D2Array,
-                    multisampled: false,
-                },
-                count: None,
-            },
-            wgpu::BindGroupLayoutEntry {
-                binding: 2,
-                visibility: wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Comparison),
-                count: None,
-            },
-        ],
+pub fn create_compute_pipeline(
+    device: &wgpu::Device,
+    layout: &wgpu::PipelineLayout,
+    shader: &wgpu::ShaderModule,
+) -> wgpu::ComputePipeline {
+    device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some("compute pipeline"),
+        layout: Some(layout),
+        module: shader,
+        entry_point: Some("c_main"),
+        compilation_options: wgpu::PipelineCompilationOptions::default(),
+        cache: None,
     })
+}
+
+pub fn create_compute_pass<'a>(encoder: &'a mut CommandEncoder) -> ComputePass<'a> {
+    encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+        label: Some("compute pass"),
+        timestamp_writes: None,
+    })
+}
+
+// macro wgpu helper
+#[macro_export]
+macro_rules! create_pp_layout {
+    ($device:expr, [$($layout:expr),* $(,)?]) => {
+        $device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("pipeline layout"),
+            bind_group_layouts: &[
+                $(Some($layout)),*
+            ],
+            ..Default::default()
+        })
+    };
 }

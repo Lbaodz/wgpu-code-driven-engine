@@ -11,7 +11,6 @@ pub struct Camera {
     aspect: f32,
     fov: f32,
     near: f32,
-    far: f32,
     yaw: f32,
     pitch: f32,
     is_moving: bool,
@@ -126,6 +125,7 @@ pub struct LightCtx {
     depth_view: wgpu::TextureView,
     shadow_bg: wgpu::BindGroup,
     light_pipeline: wgpu::RenderPipeline,
+    compute_lights_bg: wgpu::BindGroup,
 }
 
 impl LightCtx {
@@ -135,6 +135,7 @@ impl LightCtx {
         shadow_bg: wgpu::BindGroup,
         depth_view: wgpu::TextureView,
         light_pipeline: wgpu::RenderPipeline,
+        compute_lights_bg: wgpu::BindGroup,
     ) -> Self {
         Self {
             light_bg,
@@ -142,17 +143,19 @@ impl LightCtx {
             shadow_bg,
             depth_view,
             light_pipeline,
+            compute_lights_bg,
         }
     }
 }
 
 #[pub_fields]
 #[repr(C)]
-#[derive(Debug, Default, Clone, Copy, Pod, Zeroable, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Copy, Pod, Zeroable, Serialize, Deserialize)] // BAKE LATER
 pub struct LightData {
     light_matrices: Mat4,
-    color: [f32; 4],
-    dir: [f32; 4],
+    color: [f32; 4], // index 3 is type id
+    dir: [f32; 4],   // index 3 is density
+    id: [f32; 4],    // id light[0] and range[1]
 }
 
 #[pub_fields]
@@ -160,7 +163,7 @@ pub struct LightData {
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
 pub struct LightDataAlign {
     data: LightData,
-    _pad: [u32; 40],
+    _pad: [u32; 36],
 }
 
 #[pub_fields]
@@ -171,25 +174,37 @@ pub struct Light {
 }
 
 impl Light {
-    pub fn new_light(
+    pub fn new_spot_light(
         pos: Vec3,
         dir: Vec3,
-        left: f32,
-        right: f32,
-        top: f32,
-        bottom: f32,
+        fov: f32,
         near: f32,
-        far: f32,
         density: f32,
-        color: [f32; 4],
+        mut color: [f32; 4],
+        range: f32,
     ) -> Self {
         let dir_n = dir.normalize();
-        let matrix = make_light_matrix(pos, &dir_n, left, right, top, bottom, near, far);
+        let mut up = Vec3::Y;
+        if dir_n.y.abs() > 0.99 {
+            up = Vec3::Z
+        };
+        let view = glam::camera::rh::view::look_at_mat4(pos, dir_n, up);
+        let proj = glam::camera::rh::proj::directx::perspective_infinite_reverse(
+            fov.to_radians(),
+            1.0,
+            near,
+        );
+        color[3] = 1.0;
+        let mut id = [0.0; 4];
+        id[1] = range;
+
+        let matrix = proj * view;
         Self {
             data: LightData {
                 light_matrices: matrix,
                 dir: [dir_n.x, dir_n.y, dir_n.z, density],
                 color,
+                id,
             },
             planes: Planes::build_plane_from_matrix4(matrix),
         }
@@ -197,33 +212,6 @@ impl Light {
 }
 
 // helper
-fn make_light_matrix(
-    pos: Vec3,
-    dir: &Vec3,
-    left: f32,
-    right: f32,
-    top: f32,
-    bottom: f32,
-    near: f32,
-    far: f32,
-) -> Mat4 {
-    let target = pos + dir;
-    let mut up = Vec3::Y;
-    if dir.y.abs() >= 0.99 {
-        up = Vec3::Z;
-    }
-    let view = glam::camera::rh::view::look_at_mat4(pos, target, up);
-    let p = glam::camera::rh::proj::directx::orthographic(left, right, bottom, top, near, far);
-    p * view
-}
-
-#[macro_export]
-macro_rules! p3 {
-    ($x:expr, $y:expr, $z:expr $(,)?) => {
-        Vec3::new($x, $y, $z)
-    };
-}
-
 #[macro_export]
 macro_rules! v3 {
     ($x:expr, $y:expr, $z:expr $(,)?) => {

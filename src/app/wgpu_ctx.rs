@@ -25,8 +25,12 @@ pub mod ui;
 pub mod wgpu_helper;
 use crate::{
     app::wgpu_ctx::{
-        scene::{AllPipeline, camera::Light, meshes::collision::DoorAndJoint}, wgpu_helper::{create_early_depth_pipeline, create_light_pipeline},
-    }, create_pp_layout, p3, v3,
+        scene::{AllPipeline, camera::Light, meshes::collision::DoorAndJoint},
+        wgpu_helper::{
+            create_compute_pipeline, create_early_depth_pipeline, create_light_pipeline,
+        },
+    },
+    create_pp_layout, v3,
 };
 use scene::{
     RenderCtx, Scene,
@@ -74,6 +78,15 @@ impl WgpuCtx {
         }
     }
 
+    pub fn bind_basic_bg(
+        render_pass: &mut wgpu::RenderPass,
+        render_ctx: &RenderCtx,
+        light_ctx: &LightCtx,
+    ) {
+        render_pass.set_bind_group(0, &render_ctx.camera_bind_group, &[]);
+        render_pass.set_bind_group(3, &light_ctx.shadow_bg, &[]);
+    }
+
     pub fn draw_meshes(
         &self,
         meshes: &Vec<Meshes>,
@@ -84,7 +97,7 @@ impl WgpuCtx {
             panic!("cant get renderctx")
         };
 
-        for (_, mesh) in meshes.iter().enumerate() {
+        for mesh in meshes {
             render_pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
             render_pass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
             for primitive in &mesh.primitives {
@@ -569,7 +582,6 @@ impl WgpuCtx {
                     aspect: config.width as f32 / config.height as f32,
                     fov: 75.0,
                     near: 0.01,
-                    far: 75.0,
                     yaw: -90.0,
                     pitch: 0.0,
                     is_moving: true,
@@ -628,17 +640,21 @@ impl WgpuCtx {
                         } else if primitive.is_door.door && !(mesh.doors.len() == 0) {
                             if let Some(i) = primitive.is_door.id {
                                 let id = i as usize;
-                                let (door_handle, joint_handle, id_door) = meshes::load_door_collider(
-                                    &primitive,
-                                    &mut rbs,
-                                    &mut cs,
-                                    &mesh.doors,
-                                    id,
-                                    &mut impulse_joint,
-                                );
-                                door_joint_handles.entry(id_door).or_insert_with(|| {
-                                    DoorAndJoint { door_handle, joint_handle }
-                                });
+                                let (door_handle, joint_handle, id_door) =
+                                    meshes::load_door_collider(
+                                        &primitive,
+                                        &mut rbs,
+                                        &mut cs,
+                                        &mesh.doors,
+                                        id,
+                                        &mut impulse_joint,
+                                    );
+                                door_joint_handles
+                                    .entry(id_door)
+                                    .or_insert_with(|| DoorAndJoint {
+                                        door_handle,
+                                        joint_handle,
+                                    });
                             }
                         }
                     }
@@ -665,49 +681,44 @@ impl WgpuCtx {
                     });
 
                 let light_shader =
-                    device.create_shader_module(wgpu::include_wgsl!("../light.wgsl"));
+                    device.create_shader_module(wgpu::include_wgsl!("../shaders/light.wgsl"));
                 let pipeline_light_layout =
                     create_pp_layout!(&device, [&light_layout, &model_bind_group_layout]);
                 let light_pipeline =
                     create_light_pipeline(&device, &pipeline_light_layout, &light_shader);
-                let shadow_layout = wgpu_helper::create_shadow_bg_layout(&device);
 
-                let lights = vec![
-                    Light::new_light(
-                        p3!(-15.0, 8.0, 5.0),
-                        v3!(1.0, -0.3, -0.2),
-                        -10.0,
-                        10.0,
-                        10.0,
-                        -10.0,
-                        0.1,
-                        1.0,
-                        3.0,
+                let mut lights = vec![
+                    Light::new_spot_light(
+                        v3!(-25.0, 2.0, -4.0),
+                        v3!(0.5, 0.1, 0.2),
+                        45.0,
+                        0.01,
+                        2.0,
                         [0.6, 0.6, 0.5, 1.0],
+                        10.0,
                     ),
-                    Light::new_light(
-                        p3!(15.0, 8.0, 0.0),
-                        v3!(-1.0, -0.3, -0.2),
-                        -10.0,
+                    Light::new_spot_light(
+                        v3!(25.0, 2.0, 4.0),
+                        v3!(-0.5, 0.1, -0.2),
+                        45.0,
+                        0.01,
+                        2.0,
+                        [0.6, 0.6, 0.5, 1.0],
                         10.0,
-                        10.0,
-                        -10.0,
-                        0.1,
-                        1.0,
-                        3.0,
-                        [0.4, 0.4, 0.5, 1.0],
                     ),
                 ];
+                Scene::align_light_ids(&mut lights);
+                let (data_lights_buffer, cache_lights_buffer) = Scene::create_all_shadow_buffer(&device, &config, &lights);
                 let light_tt: (Vec<wgpu::TextureView>, wgpu::Sampler, wgpu::TextureView) =
                     scene::Scene::create_shadow_tt(&device, 1024, 1024, &lights);
 
-                let shadow_bg = Scene::create_shadow_bindgroup(
-                    &device,
-                    &shadow_layout,
-                    &light_tt.2,
-                    &light_tt.1,
-                    &lights,
-                );
+                let (shadow_bg, shadow_layout) =
+                    Scene::create_shadow_bindgroup(&device, &light_tt.2, &light_tt.1, &data_lights_buffer, &cache_lights_buffer);
+
+                let (
+                    compute_lights_bg,
+                    compute_lights_bg_layout,
+                ) = Scene::create_cache_light_bg(&device, &data_lights_buffer, &cache_lights_buffer);
 
                 let light_ctx = LightCtx::new(
                     Scene::create_light_bindgroup(&device, &light_layout, &lights),
@@ -715,6 +726,7 @@ impl WgpuCtx {
                     shadow_bg,
                     light_tt.2,
                     light_pipeline,
+                    compute_lights_bg,
                 );
 
                 let camera_bind_group_layout =
@@ -745,9 +757,10 @@ impl WgpuCtx {
                     usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
                 });
 
-                let shader = device.create_shader_module(wgpu::include_wgsl!("../main.wgsl"));
+                let shader =
+                    device.create_shader_module(wgpu::include_wgsl!("../shaders/main.wgsl"));
                 let early_depth_shader =
-                    device.create_shader_module(wgpu::include_wgsl!("../early_depth.wgsl"));
+                    device.create_shader_module(wgpu::include_wgsl!("../shaders/early_depth.wgsl"));
 
                 let pipeline_basic_layout = create_pp_layout!(
                     &device,
@@ -789,10 +802,20 @@ impl WgpuCtx {
                     }],
                 });
 
+                let compute_shader =
+                    device.create_shader_module(wgpu::include_wgsl!("../shaders/c_shader.wgsl"));
+                let compute_layout = create_pp_layout!(
+                    &device,
+                    [&camera_bind_group_layout, &compute_lights_bg_layout,]
+                );
+                let compute_pipeline =
+                    create_compute_pipeline(&device, &compute_layout, &compute_shader);
+
                 let pipeline = AllPipeline {
                     render_pipeline,
                     transparency_pipeline,
                     early_depth_pipeline,
+                    compute_pipeline,
                 };
 
                 let render_ctx = RenderCtx {

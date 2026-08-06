@@ -1,8 +1,8 @@
 struct LightData {
     matrix: mat4x4f,
-    color: vec3f,
-    dir: vec3f,
-    density: f32,
+    color: vec4f,
+    dir: vec4f,
+    id: vec4u,
 }
 
 struct VtIn {
